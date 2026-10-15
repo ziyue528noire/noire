@@ -21,7 +21,7 @@ import risk
 from keys import load_keys
 from paths import rt
 
-ROTATION_TASK = "Excaliber Paper Rotation"
+ROTATION_TASK = "Noire Paper Rotation"
 LOG = rt("logs", "emergency_log.txt")
 
 

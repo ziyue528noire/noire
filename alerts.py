@@ -30,7 +30,7 @@ def notify(title: str, body: str):
         print(f"通知发送失败：{e}")
 
 
-def add(msg: str, title: str = "Excaliber 交易警报", popup: bool = True):
+def add(msg: str, title: str = "Noire 交易警报", popup: bool = True):
     os.makedirs(os.path.dirname(ALERTS), exist_ok=True)
     with open(ALERTS, "a", encoding="utf-8") as f:
         f.write(f"{dt.datetime.now():%Y-%m-%d %H:%M}  {msg}\n")

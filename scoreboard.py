@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""成绩单：每个交易日记一行净值，和同期 SPY 比较。
+r"""成绩单：每个交易日记一行净值，和同期 SPY 比较。
 
   python scoreboard.py        生成 reports/scoreboard.txt
 
@@ -64,6 +64,21 @@ def sync_shared():
     os.replace(tmp, MY_SHARED)   # 原子替换：对方任何时候读到的都是完整文件
 
 
+def spy_closes() -> dict:
+    """SPY 每日收盘价（来自本地行情缓存），让每个系统都能按自己的起止日期和 SPY 比较。"""
+    path = os.path.join(HERE, config.DATA_DIR, "SPY.csv") if not os.path.isabs(config.DATA_DIR) \
+        else os.path.join(config.DATA_DIR, "SPY.csv")
+    out = {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            for r in csv.DictReader(f):
+                d = (r.get("Date") or next(iter(r.values())))[:10]
+                out[d] = float(r["Close"])
+    except Exception:
+        pass
+    return out
+
+
 def stats(rows: list, spy_by_date: dict) -> dict:
     eq = [float(r["equity"]) for r in rows]
     dates = [r["date"] for r in rows]
@@ -80,7 +95,10 @@ def stats(rows: list, spy_by_date: dict) -> dict:
            "total": eq[-1] / eq[0] - 1, "max_dd": mdd,
            "vol": sd * math.sqrt(252),
            "sharpe": (mean / sd * math.sqrt(252)) if sd > 0 and len(rets) >= 20 else None}
-    s0, s1 = spy_by_date.get(dates[0]), spy_by_date.get(dates[-1])
+    def near(d):
+        ks = [k for k in spy_by_date if k <= d]
+        return spy_by_date[max(ks)] if ks else None
+    s0, s1 = near(dates[0]), near(dates[-1])
     if s0 and s1:
         out["spy"] = s1 / s0 - 1
         out["excess"] = out["total"] - out["spy"]
@@ -93,8 +111,9 @@ def main():
     except Exception as e:
         print(f"同步共享成绩单失败（不影响交易）：{e}")
     mine = read(HISTORY)
-    spy = {r["date"]: float(r["spy_close"]) for r in mine if r.get("spy_close")}
-    systems = {"Claude 动量轮动（2倍杠杆）": mine}
+    spy = spy_closes()
+    spy.update({r["date"]: float(r["spy_close"]) for r in mine if r.get("spy_close")})
+    systems = {"Noire 动量轮动（Claude，2倍杠杆）": mine}
     others = glob.glob(os.path.join(OTHERS_DIR, "*.csv")) + glob.glob(os.path.join(SHARED_DIR, "*.csv"))
     for p in sorted(others):
         name = os.path.splitext(os.path.basename(p))[0]
@@ -103,7 +122,7 @@ def main():
         label = {"gpt": "ChatGPT 盘中学习系统"}.get(name, name)
         systems[label] = read(p)
 
-    lines = [f"Excaliber 成绩单　更新 {dt.datetime.now():%Y-%m-%d %H:%M}",
+    lines = [f"Noire 成绩单　更新 {dt.datetime.now():%Y-%m-%d %H:%M}",
              "同一时期比较；超额 = 系统收益 − 同期 SPY；夏普需满 20 个交易日才计算", ""]
     for name, rows in systems.items():
         s = stats(rows, spy)   # 各系统都和同一份 SPY 价格比较（按各自的起止日期）

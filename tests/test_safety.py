@@ -100,7 +100,7 @@ class SafetyTests(unittest.TestCase):
         self.assertEqual({o.symbol for o in buys}, {"QQQ", "EEM"})
         notional = sum(float(o.qty) * last_price(o.symbol) for o in buys)
         self.assertAlmostEqual(notional / 100000, 2 * (1 - config.CASH_BUFFER), delta=0.02)
-        self.assertTrue(all(o.client_order_id.startswith("exc-rot-") for o in buys))
+        self.assertTrue(all(o.client_order_id.startswith("noire-rot-") for o in buys))
         self.assertEqual(B.paper_flags and set(B.paper_flags), {True})
 
     def test_dry_run_sends_nothing(self):
@@ -201,7 +201,7 @@ class SafetyTests(unittest.TestCase):
                            {"symbol": "AAPL", "side": "buy", "qty": 10}])      # 合法
         self.assertEqual(out.count("✗ 拒绝"), 5)
         self.assertEqual(len(B.orders), 1)
-        self.assertTrue(B.orders[0].client_order_id.startswith("exc-man-"))
+        self.assertTrue(B.orders[0].client_order_id.startswith("noire-man-"))
         self.assertFalse(os.path.exists(trade.ORDER_FILE))                  # 执行后移走
 
     def test_manual_same_file_twice_blocked(self):

@@ -10,11 +10,11 @@ if not exist logs mkdir logs
     echo GIT_NOT_FOUND
   ) else (
     if not exist .git call _git.bat init
-    call _git.bat config user.name "Excaliber Bot"
-    call _git.bat config user.email "excaliber-bot@localhost"
+    call _git.bat config user.name "Noire Bot"
+    call _git.bat config user.email "noire-bot@localhost"
     call _git.bat config core.autocrlf false
     call _git.bat add -A
-    call _git.bat commit -m "Excaliber: risk ledger, reconciliation, safety tests, scoreboard"
+    call _git.bat commit -m "Noire: risk ledger, reconciliation, safety tests, scoreboard"
     echo ----- tracked files -----
     call _git.bat ls-files
     echo ----- ignored check -----

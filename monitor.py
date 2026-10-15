@@ -206,7 +206,7 @@ def finish(now, found, info_lines):
     for k, m in new:
         alerts.add(m, popup=False)
     if new:
-        alerts.notify("Excaliber 交易警报", "；".join(m for _, m in new))
+        alerts.notify("Noire 交易警报", "；".join(m for _, m in new))
     state = {today: sent + [k for k, _ in new]}
     os.makedirs(os.path.dirname(MON_STATE), exist_ok=True)
     with open(MON_STATE, "w", encoding="utf-8") as f:
@@ -225,7 +225,7 @@ def finish(now, found, info_lines):
 
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "test":
-        alerts.notify("Excaliber 测试通知", "如果你看到这条消息，说明异常提醒能正常弹出。")
+        alerts.notify("Noire 测试通知", "如果你看到这条消息，说明异常提醒能正常弹出。")
         print("测试通知已发送")
         sys.exit(0)
     try:
@@ -234,4 +234,4 @@ if __name__ == "__main__":
         err = traceback.format_exc()
         print(err)
         append(LOG, f"{dt.datetime.now():%m-%d %H:%M}  监控程序出错：{err.strip().splitlines()[-1]}")
-        alerts.notify("Excaliber 监控出错", err.strip().splitlines()[-1][:200])
+        alerts.notify("Noire 监控出错", err.strip().splitlines()[-1][:200])

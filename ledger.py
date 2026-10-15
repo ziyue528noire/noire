@@ -15,7 +15,7 @@ import datetime as dt
 from paths import rt
 
 LEDGER = rt("logs", "order_ledger.jsonl")
-PREFIX = "exc-"
+PREFIX = "noire-"
 
 
 class UncertainOrder(Exception):
