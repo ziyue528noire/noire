@@ -8,6 +8,8 @@ echo.
 schtasks /Create /TN "Noire Paper Rotation" /TR "wscript.exe //B \"%~dp0run_hidden.vbs\" \"%~dp0run_paper.bat\"" /SC WEEKLY /D MON,TUE,WED,THU,FRI /ST 17:00 /RI 30 /DU 01:01 /F
 schtasks /Create /TN "Noire Monitor" /TR "wscript.exe //B \"%~dp0run_hidden.vbs\" \"%~dp0run_monitor.bat\"" /SC WEEKLY /D MON,TUE,WED,THU,FRI /ST 09:45 /RI 60 /DU 06:01 /F
 echo.
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0task_settings.ps1"
+echo.
 (
   schtasks /Query /TN "Noire Paper Rotation" /V /FO LIST
   schtasks /Query /TN "Noire Monitor" /V /FO LIST

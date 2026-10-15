@@ -15,3 +15,6 @@ equity_history.csv
 risk_state.json
 paper_state.json
 *_log.txt
+
+# research data (downloaded, large)
+research/data/
