@@ -9,7 +9,7 @@
 1. 安装 Python 3.10 以上版本：https://www.python.org/downloads/ （安装时勾选 **Add Python to PATH**）
 2. 打开命令提示符（Win+R → 输入 `cmd`），然后运行：
    ```
-   cd /d D:\claude\trader
+   cd /d D:\claude\Noire
    pip install -r requirements.txt
    python backtest.py
    ```
