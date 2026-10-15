@@ -65,6 +65,8 @@ import trade                             # noqa: E402
 import monitor                           # noqa: E402
 import emergency                         # noqa: E402
 import scoreboard                        # noqa: E402
+import paper_job                         # noqa: E402
+paper_job.run_preflight = lambda: True    # 测试里不再递归运行整套测试
 for m in (paper_rotation, trade, monitor, emergency):
     if hasattr(m, "load_keys"):
         m.load_keys = keys.load_keys
@@ -273,7 +275,8 @@ class SafetyTests(unittest.TestCase):
         other = os.path.join(scoreboard.SHARED_DIR, "gpt.csv")
         with open(other, "w", encoding="utf-8") as f:
             f.write("date,equity\n2026-01-02,99000\n2026-01-05,99100\n")
-        before = open(other, encoding="utf-8").read()
+        with open(other, encoding="utf-8") as f:
+            before = f.read()
         with open(paper_rotation.STATE_FILE, "w", encoding="utf-8") as f:
             json.dump({"start_date": "2026-01-02", "start_equity": 100000, "spy_start": 500}, f)
         buf = io.StringIO()
@@ -281,8 +284,84 @@ class SafetyTests(unittest.TestCase):
             paper_rotation.record_score(dt.date(2026, 1, 5), 102000, 505, 1.9, 0.0)
         mine = scoreboard.read(scoreboard.MY_SHARED)
         self.assertEqual([r["equity"] for r in mine], ["100000.00", "102000.00"])
-        self.assertEqual(open(other, encoding="utf-8").read(), before)  # 对方文件原封不动
+        with open(other, encoding="utf-8") as f:
+            self.assertEqual(f.read(), before)                          # 对方文件原封不动
         self.assertIn("ChatGPT", buf.getvalue())
+
+    # ---------- 有限次数自动重试 ----------
+    def _job(hour, minute):
+        return run(lambda: paper_job.main(dt.datetime.combine(dt.date.today(), dt.time(hour, minute))))
+
+    def _alerts_text(self):
+        p = os.path.join(paths.RUNTIME, "alerts.txt")
+        if not os.path.exists(p):
+            return ""
+        with open(p, encoding="utf-8") as f:
+            return f.read()
+
+    def test_retry_skips_after_success(self):
+        out = SafetyTests._job(17, 0)
+        n = len(B.orders)
+        self.assertGreater(n, 0)
+        for o in B.orders:                                   # 模拟已成交，没有未成交订单
+            o.status = fakebroker._Status("filled")
+        out2 = SafetyTests._job(17, 30)
+        self.assertIn("已经成功完成", out2)
+        self.assertEqual(len(B.orders), n)                   # 重试时间点不会再下单
+
+    def test_retry_only_alerts_on_final_failure(self):
+        orig = paper_job.run_rotation
+        paper_job.run_rotation = lambda: (_ for _ in ()).throw(ConnectionError("read timed out"))
+        try:
+            SafetyTests._job(17, 0)
+            SafetyTests._job(17, 30)
+            self.assertEqual(self._alerts_text(), "")         # 前两次不报警
+            SafetyTests._job(18, 0)
+            self.assertIn("3 次都失败", self._alerts_text())   # 第 3 次才报警
+            out = SafetyTests._job(18, 30)
+            self.assertIn("不再重试", out)
+        finally:
+            paper_job.run_rotation = orig
+
+    def test_retry_recovers_after_network_error(self):
+        orig, calls = paper_job.run_rotation, []
+
+        def flaky():
+            calls.append(1)
+            if len(calls) == 1:
+                raise ConnectionError("read timed out")
+            return orig()
+        paper_job.run_rotation = flaky
+        try:
+            SafetyTests._job(17, 0)
+            self.assertEqual(B.orders, [])
+            out = SafetyTests._job(17, 30)
+            self.assertIn("第 2 次尝试成功", out)
+            self.assertTrue(B.orders)
+            self.assertEqual(self._alerts_text(), "")
+        finally:
+            paper_job.run_rotation = orig
+
+    def test_lock_prevents_overlap(self):
+        os.makedirs(os.path.dirname(paper_job.LOCK), exist_ok=True)
+        open(paper_job.LOCK, "w").close()                    # 另一次运行正在进行
+        out = SafetyTests._job(17, 30)
+        self.assertIn("还在运行", out)
+        self.assertEqual(B.orders, [])
+        old = dt.datetime.now().timestamp() - 30 * 60          # 30 分钟前的锁 = 上次异常退出残留
+        os.utime(paper_job.LOCK, (old, old))
+        SafetyTests._job(17, 30)
+        self.assertTrue(B.orders)
+        self.assertFalse(os.path.exists(paper_job.LOCK))       # 运行结束后锁被释放
+
+    def test_unresolved_order_counts_as_failure_and_retries(self):
+        B.fail_next_submit = "not_received"
+        SafetyTests._job(17, 0)                              # 第一笔结果不明 → 本次算失败
+        st = paper_job.load_state(f"{dt.date.today():%Y-%m-%d}")
+        self.assertFalse(st["success"])
+        SafetyTests._job(17, 30)                             # 重试：先核实（券商没收到）再正常下单
+        self.assertTrue(B.orders)
+        self.assertTrue(paper_job.load_state(f"{dt.date.today():%Y-%m-%d}")["success"])
 
 
 if __name__ == "__main__":

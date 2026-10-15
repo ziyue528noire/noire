@@ -73,7 +73,7 @@ def main():
     client = TradingClient(key, secret, paper=True)     # 只连模拟盘
     if risk.is_stopped():
         print("检测到 STOP 文件（紧急停止中），本次不做任何操作。双击 resume_trading.bat 可恢复。")
-        return
+        return "stopped"
 
     # ---- 0. 先核实台账里结果不明的订单；查不清楚就不交易 ----
     still = ledger.resolve(client)
@@ -82,7 +82,7 @@ def main():
         print(msg)
         if live:
             alerts.add(msg)
-        return
+        return "blocked"
 
     # ---- 1. 最新数据 + 信号 ----
     symbols = config.ROTATION_UNIVERSE + [config.CASH_SYMBOL]
@@ -117,6 +117,12 @@ def main():
     no_buy = day_chg < -config.DAILY_LOSS_LIMIT
     if no_buy:
         print(f"风控：今天亏损 {day_chg:.1%}，超过 {config.DAILY_LOSS_LIMIT:.0%} 上限，今天只允许卖出")
+    gross_now = sum(v for q, v in all_pos.values())
+    maint = float(getattr(acct, "maintenance_margin", 0) or 0)
+    dist = risk.margin_distance(equity, gross_now, maint / gross_now if gross_now and maint else None)
+    risk_line = (f"实际杠杆 {gross_now / equity if equity else 0:.2f}x　"
+                 f"距追缴保证金 {'—（没借钱）' if gross_now <= equity else f'再跌 {dist:.0%}'}")
+    print(f"风控：{risk_line}")
 
     if live:   # 成绩单：每天记一行（第一次会先补上起点那一天）
         gross = sum(v for q, v in all_pos.values())
@@ -129,8 +135,8 @@ def main():
         print(f"有 {len(open_orders)} 笔订单还没成交，本次不再下单（等它们成交后再检查）")
         for o in open_orders:
             print(f"  待成交：{o.side.value} {o.qty} {o.symbol}")
-        write_status(equity, positions, target, signal_day, ["有未成交订单，跳过"], closes)
-        return
+        write_status(equity, positions, target, signal_day, ["有未成交订单，跳过"], closes, risk_line=risk_line)
+        return "ok"
 
     # ---- 3. 算出要买卖什么 ----
     strategy_equity = max(equity - manual_value, 0)
@@ -208,7 +214,8 @@ def main():
     elif orders:
         print("（空跑，没有下单。加 --live 才会提交）")
 
-    write_status(equity, positions, target, signal_day, actions, closes, live)
+    write_status(equity, positions, target, signal_day, actions, closes, live, risk_line=risk_line)
+    return "blocked" if stopped else "ok"
 
 
 def record_score(day, equity, spy_close, leverage, drawdown):
@@ -234,7 +241,7 @@ def log_trade(when, sym, side, qty, ref_price, why):
         f.write(f"{when:%Y-%m-%d %H:%M},{sym},{side},{qty:g},{ref_price:.2f},{why}\n")
 
 
-def write_status(equity, positions, target, signal_day, actions, closes, live=False):
+def write_status(equity, positions, target, signal_day, actions, closes, live=False, risk_line=""):
     """生成一页状态报告，并和“同期一直持有 SPY”比较。"""
     spy_now = float(closes["SPY"].iloc[-1])
     state = {}
@@ -250,6 +257,7 @@ def write_status(equity, positions, target, signal_day, actions, closes, live=Fa
              f"账户净值：${equity:,.2f}",
              f"信号日期：{signal_day}　目标：{', '.join(f'{s} {w:.0%}' for s, w in target.items())}",
              f"当前持仓：{', '.join(f'{s} {q:g}股' for s, (q, v) in positions.items()) or '无'}",
+             *([f"风险：{risk_line}"] if risk_line else []),
              "本次操作：", *[f"  {a}" for a in actions]]
     if state:
         mine = equity / state["start_equity"] - 1
