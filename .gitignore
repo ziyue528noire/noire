@@ -1,0 +1,17 @@
+# secrets
+.env
+.env.txt
+# runtime data (not code)
+data/
+logs/
+orders/
+reports/
+versions/
+scoreboard/
+__pycache__/
+STOP
+alerts.txt
+equity_history.csv
+risk_state.json
+paper_state.json
+*_log.txt
