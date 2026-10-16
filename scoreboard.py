@@ -113,7 +113,7 @@ def main():
     mine = read(HISTORY)
     spy = spy_closes()
     spy.update({r["date"]: float(r["spy_close"]) for r in mine if r.get("spy_close")})
-    systems = {"Noire 动量轮动（Claude，2倍杠杆）": mine}
+    systems = {f"Noire 动量轮动（Claude，{config.STRATEGY_NAME}，杠杆 1~2 倍）": mine}
     others = glob.glob(os.path.join(OTHERS_DIR, "*.csv")) + glob.glob(os.path.join(SHARED_DIR, "*.csv"))
     for p in sorted(others):
         name = os.path.splitext(os.path.basename(p))[0]

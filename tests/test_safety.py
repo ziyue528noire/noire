@@ -97,13 +97,16 @@ class SafetyTests(unittest.TestCase):
 
     # ---------- 自动换仓 ----------
     def test_builds_2x_from_empty_account(self):
-        run(paper_rotation.main, "--live")
+        out = run(paper_rotation.main, "--live")
         buys = [o for o in B.orders if o.side.value == "buy"]
         self.assertEqual({o.symbol for o in buys}, {"QQQ", "EEM"})
         notional = sum(float(o.qty) * last_price(o.symbol) for o in buys)
+        # 假行情很平稳、SPY 在 200 日线上方 → 波动目标给出上限 2 倍
         self.assertAlmostEqual(notional / 100000, 2 * (1 - config.CASH_BUFFER), delta=0.02)
         self.assertTrue(all(o.client_order_id.startswith("noire-rot-") for o in buys))
         self.assertEqual(B.paper_flags and set(B.paper_flags), {True})
+        self.assertIn("四批信号", out)
+        self.assertIn("杠杆 2.00 倍", out)
 
     def test_dry_run_sends_nothing(self):
         out = run(paper_rotation.main)
@@ -134,16 +137,34 @@ class SafetyTests(unittest.TestCase):
         self.assertTrue(B.orders)
         self.assertTrue(all(o.side.value == "sell" for o in B.orders))
 
-    def test_circuit_breaker_drops_to_1x(self):
+    def test_drawdown_alone_no_longer_forces_1x(self):
+        # 2026-10-15 起取消“回撤 >20% 降到 1 倍”的熔断：回撤 25% 但市场平静、趋势向上 → 仍按 2 倍目标
         risk.save_state({"peak_equity": 100000})
-        B.equity, B.cash, B.last_equity = 75000, -75000, 76000
+        B.equity, B.cash, B.last_equity = 75000, -72000, 76000
         q, e = last_price("QQQ"), last_price("EEM")
-        B.positions = {"QQQ": (int(75000 / q), 75000), "EEM": (int(75000 / e), 75000)}
+        B.positions = {"QQQ": (int(73500 / q), 73500), "EEM": (int(73500 / e), 73500)}
         out = run(paper_rotation.main, "--live")
-        self.assertIn("熔断", out)
+        self.assertNotIn("熔断", out)
         sold = sum(float(o.qty) * last_price(o.symbol) for o in B.orders if o.side.value == "sell")
-        self.assertGreater(sold, 60000)        # 15 万持仓要降到约 7.35 万
-        self.assertFalse(any(o.side.value == "buy" for o in B.orders))
+        self.assertLess(sold, 10000)           # 不会再把 14.7 万持仓砍到 7 万多
+
+    def test_downtrend_caps_leverage_at_1x(self):
+        spy_path = os.path.join(DATA_DIR, "SPY.csv")
+        with open(spy_path, encoding="utf-8") as f:
+            original = f.read()
+        idx = pd.bdate_range("2009-01-01", dt.date.today())
+        c = np.exp(np.cumsum(np.random.default_rng(42).normal(-0.0015, 0.004, len(idx))))
+        c = c / c[-1] * 100
+        pd.DataFrame({"Open": c, "High": c, "Low": c, "Close": c, "Volume": 1e6}, index=idx).to_csv(spy_path)
+        try:
+            out = run(paper_rotation.main, "--live")
+        finally:
+            with open(spy_path, "w", encoding="utf-8") as f:
+                f.write(original)
+        self.assertIn("低于 200 日均线", out)
+        buys = [o for o in B.orders if o.side.value == "buy"]
+        notional = sum(float(o.qty) * last_price(o.symbol) for o in buys)
+        self.assertAlmostEqual(notional / 100000, 1 * (1 - config.CASH_BUFFER), delta=0.02)
 
     def test_daily_loss_blocks_buys(self):
         B.equity, B.cash, B.last_equity = 94000, 94000, 100000
@@ -362,6 +383,91 @@ class SafetyTests(unittest.TestCase):
         SafetyTests._job(17, 30)                             # 重试：先核实（券商没收到）再正常下单
         self.assertTrue(B.orders)
         self.assertTrue(paper_job.load_state(f"{dt.date.today():%Y-%m-%d}")["success"])
+
+
+import aplus                             # noqa: E402
+
+
+def synthetic(rets, n=400, start="2024-01-01"):
+    """按每只的“日收益序列生成器”造价格表：rets = {代码: 函数(i) -> 第 i 天收益}，没列出的保持不变。"""
+    idx = pd.bdate_range(start, periods=n)
+    cols = list(config.ROTATION_UNIVERSE) + [config.CASH_SYMBOL]
+    out = {}
+    for s in cols:
+        f = rets.get(s, lambda i: 0.0)
+        out[s] = 100 * np.cumprod([1 + f(i) for i in range(n)])
+    return pd.DataFrame(out, index=idx)
+
+
+def alternating(x, drift=0.0):
+    return lambda i: drift + (x if i % 2 else -x)
+
+
+class APlusTests(unittest.TestCase):
+    """A+ 稳健版的规则：分 4 批、波动小的多买、波动目标、趋势开关、不借钱买现金。"""
+
+    def test_tranche_dates(self):
+        days = pd.bdate_range("2026-06-01", "2026-10-31")
+        got = aplus.latest_signal_dates(days, dt.date(2026, 10, 15))
+        self.assertEqual(got, {0: dt.date(2026, 9, 30), 5: dt.date(2026, 9, 23),
+                               10: dt.date(2026, 9, 16), 15: dt.date(2026, 10, 9)})
+        got = aplus.latest_signal_dates(days, dt.date(2026, 10, 30))      # 月末当天：4 批都是本月的
+        self.assertEqual(got[0], dt.date(2026, 10, 30))
+        self.assertEqual(got[15], dt.date(2026, 10, 9))
+
+    def test_inverse_vol_weights_and_negative_score_to_cash(self):
+        up = 0.004
+        c = synthetic({"QQQ": alternating(0.02, up), "EEM": alternating(0.01, up)})
+        w, _ = aplus.tranche_weights(c, c.index[-1])
+        self.assertAlmostEqual(w["QQQ"], 1 / 3, delta=0.02)             # 波动大一倍 → 只拿一半的份额
+        self.assertAlmostEqual(w["EEM"], 2 / 3, delta=0.02)
+        c = synthetic({"QQQ": alternating(0.01, up), "EEM": alternating(0.01, -0.001),
+                       **{s: alternating(0.01, -0.002) for s in ("SPY", "IWM", "EFA", "TLT", "GLD")}})
+        w, _ = aplus.tranche_weights(c, c.index[-1])
+        self.assertAlmostEqual(w["QQQ"], 0.5, delta=0.02)
+        self.assertAlmostEqual(w[config.CASH_SYMBOL], 0.5, delta=0.02)  # 第二名也在跌 → 那一份拿现金
+
+    def test_vol_target_floor_and_cap(self):
+        spy_up = alternating(0.001, 0.001)                              # SPY 稳步上涨 → 趋势开关允许加杠杆
+        base = pd.Series({"QQQ": 1.0})
+        for x, expect in ((0.005, 2.0), (0.01, None), (0.03, 1.0)):
+            c = synthetic({"QQQ": alternating(x), "SPY": spy_up})
+            lev, msg, det = aplus.leverage(c, base)
+            if expect is None:
+                expect = config.VOL_TARGET / det["vol"]
+                self.assertTrue(1.0 < expect < 2.0)
+            self.assertAlmostEqual(lev, expect, places=6)
+            self.assertTrue(det["trend_ok"])
+
+    def test_trend_switch_caps_at_1x(self):
+        c = synthetic({"QQQ": alternating(0.002), "SPY": alternating(0.001, -0.001)})
+        lev, msg, det = aplus.leverage(c, pd.Series({"QQQ": 1.0}))
+        self.assertFalse(det["trend_ok"])
+        self.assertEqual(lev, 1.0)
+        self.assertIn("最多 1 倍", msg)
+
+    def test_never_borrow_to_hold_cash(self):
+        base = pd.Series({"QQQ": 0.5, "EEM": 0.0, config.CASH_SYMBOL: 0.5})
+        w = aplus.final_weights(base, 2.0)
+        self.assertAlmostEqual(w["QQQ"], 1.0)
+        self.assertNotIn(config.CASH_SYMBOL, w.index)                  # 风险资产已用满本金 → 不借钱买 SHY
+        w = aplus.final_weights(base, 1.5)
+        self.assertAlmostEqual(w["QQQ"], 0.75)
+        self.assertAlmostEqual(w[config.CASH_SYMBOL], 0.25)
+        self.assertLessEqual(float(aplus.final_weights(base, 2.0).sum()), config.LEVERAGE + 1e-9)
+
+    def test_four_tranches_average(self):
+        # 换仓日不同的几批会选出不同的组合：前半段 GLD 最强，后来 QQQ 最强
+        n = 400
+        c = synthetic({"GLD": lambda i: 0.004 if i < n - 12 else -0.03,
+                       "QQQ": lambda i: 0.002 if i < n - 12 else 0.02,
+                       "EEM": lambda i: 0.003})
+        days = pd.bdate_range(c.index[0], c.index[-1] + pd.offsets.MonthEnd(0))
+        base, notes = aplus.base_weights(c, days, c.index[-1])
+        self.assertAlmostEqual(float(base.sum()), 1.0, places=9)
+        self.assertEqual(len(notes), 4)
+        dates = aplus.latest_signal_dates(days, c.index[-1].date())
+        self.assertEqual(len(set(dates.values())), 4)                    # 4 批各有自己的换仓日
 
 
 if __name__ == "__main__":

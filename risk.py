@@ -1,9 +1,11 @@
 # -*- coding: utf-8 -*-
-"""风控熔断：独立于策略的硬规则，所有下单程序都必须先过这里。
+"""风控硬规则：独立于策略，所有下单程序都必须先过这里。
 
   - STOP 文件存在           → 禁止任何交易（紧急停止后生效，resume_trading.bat 解除）
-  - 账户回撤 > 20%          → 杠杆强制降到 1 倍；回撤收窄到 10% 以内才恢复
   - 单日亏损 > 5%           → 当天不再买入
+  - 杠杆上限 2 倍、只按券商隔夜购买力（Reg T）下单（在 paper_rotation.py 里执行）
+原来的“回撤 >20% 降到 1 倍”熔断已于 2026-10-15 取消（研究显示它在低点降杠杆、长期卡在 1 倍，
+反而比不加杠杆差）；杠杆改由 aplus.py 的波动目标 + 趋势开关提前控制。回撤仍会记录并报警。
 状态保存在 risk_state.json（记录账户历史最高净值、每天的起始净值）。
 """
 import json
@@ -45,24 +47,6 @@ def update_peak(equity: float) -> dict:
     st["updated"] = f"{dt.datetime.now():%Y-%m-%d %H:%M}"
     save_state(st)
     return {"peak": peak, "drawdown": 1 - equity / peak if peak > 0 else 0.0}
-
-
-def effective_leverage(equity: float):
-    """根据回撤决定今天允许的杠杆。返回 (杠杆, 说明)。带“滞后区间”，避免来回切换。"""
-    info = update_peak(equity)
-    st = load_state()
-    dd = info["drawdown"]
-    delevered = bool(st.get("delevered", False))
-    if not delevered and dd > config.DELEVER_DRAWDOWN:
-        delevered = True
-    elif delevered and dd < config.RELEVER_DRAWDOWN:
-        delevered = False
-    st["delevered"] = delevered
-    save_state(st)
-    if delevered and config.LEVERAGE > 1:
-        return 1.0, (f"熔断：账户回撤 {dd:.1%}（最高 ${info['peak']:,.0f}），杠杆降为 1 倍；"
-                     f"回撤收窄到 {config.RELEVER_DRAWDOWN:.0%} 以内后恢复")
-    return config.LEVERAGE, f"回撤 {dd:.1%}，杠杆 {config.LEVERAGE:g} 倍正常"
 
 
 def day_base(equity: float, last_equity: float) -> float:

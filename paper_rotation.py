@@ -1,12 +1,13 @@
 # -*- coding: utf-8 -*-
-"""动量轮动 · Alpaca 模拟盘自动换仓
+"""动量轮动（A+ 稳健版）· Alpaca 模拟盘自动换仓
 
   python paper_rotation.py          空跑：只打印打算怎么做，不下单
   python paper_rotation.py --live   真正向【模拟盘】提交订单
 
 设计成每个交易日收盘后运行一次（由 Windows 计划任务自动执行）：
-  - 只有在“每月最后一个交易日”才会产生新信号；其他日子沿用上个月末的信号
-  - 每天按最新净值把仓位调回目标杠杆（亏了会自动减仓）
+  - 目标仓位和杠杆由 aplus.py 计算：分 4 批换仓（月末、月末前第 5/10/15 个交易日）、
+    波动小的多买、杠杆 = 30% 波动目标（1~2 倍），SPY 在 200 日线下方时最多 1 倍
+  - 每天按最新净值把仓位调回目标（相差不到总资产 5% 不动）
   - 订单是市价单，收盘后提交 → 下一个交易日开盘成交（和回测假设一致）
   - 每笔订单有唯一编号，先记台账再提交；结果不明时停止并报警，绝不自动重试
   - 已有未成交订单、台账里有未核实的订单、STOP 文件存在时都不会下单
@@ -23,9 +24,10 @@ import risk
 import ledger
 import alerts
 import scoreboard
+import aplus
 from paths import rt, HERE
 from keys import load_keys
-from rotation import load_panel, target_weights
+from rotation import load_panel
 
 os.chdir(HERE)   # 不管从哪里启动，相对路径（data/）都指向本文件夹
 STATE_FILE = rt("paper_state.json")
@@ -33,30 +35,20 @@ TRADE_LOG = rt("logs", "trades.csv")
 STATUS_FILE = rt(config.REPORT_DIR, "paper_status.txt")
 
 
-def last_trading_day_of_month(client, day: dt.date) -> dt.date:
-    """用 Alpaca 的交易日历找出本月最后一个交易日（会考虑节假日）。"""
-    month_end = (pd.Timestamp(day) + pd.offsets.MonthEnd(0)).date()
+def trading_calendar(client, as_of: dt.date):
+    """约 4 个月前到本月底的交易日（Alpaca 交易日历，会考虑节假日）；获取失败时用工作日近似。
+    需要“本月底”是为了知道月末和月末前第 5/10/15 个交易日是哪天。"""
+    start = (pd.Timestamp(as_of) - pd.DateOffset(months=4)).replace(day=1).date()
+    end = (pd.Timestamp(as_of) + pd.offsets.MonthEnd(0)).date()
     try:
         from alpaca.trading.requests import GetCalendarRequest
-        cal = client.get_calendar(GetCalendarRequest(start=day, end=month_end))
-        days = [c.date if isinstance(c.date, dt.date) else pd.Timestamp(c.date).date() for c in cal]
+        cal = client.get_calendar(GetCalendarRequest(start=start, end=end))
+        days = sorted({aplus._as_date(c.date) for c in cal})
         if days:
-            return max(days)
+            return days
     except Exception as e:
         print(f"  (交易日历获取失败，改用工作日近似：{e})")
-    return (pd.Timestamp(day) + pd.offsets.BMonthEnd(0)).date()
-
-
-def current_signal(closes: pd.DataFrame, client):
-    """返回 (目标权重, 信号日期)。只用“已经结束的月份”的月末收盘来定信号。"""
-    last_day = closes.index[-1].date()
-    if last_day == last_trading_day_of_month(client, last_day):
-        cutoff = closes.index[-1]                       # 今天就是月末 → 用今天收盘出新信号
-    else:
-        this_month = closes.index.to_period("M") == closes.index[-1].to_period("M")
-        cutoff = closes.index[~this_month][-1]          # 否则用上个月最后一个交易日
-    w = target_weights(closes.loc[:cutoff], config.TOP_N).iloc[-1]
-    return w[w > 0], cutoff.date()
+    return [d.date() for d in pd.bdate_range(start, end)]
 
 
 def main():
@@ -93,9 +85,12 @@ def main():
     age = (pd.Timestamp(now.date()) - closes.index[-1]).days
     if age > 5:
         sys.exit(f"数据太旧（最新一天是 {closes.index[-1].date()}），为安全起见不操作")
-    target, signal_day = current_signal(closes, client)
-    print(f"最新数据：{closes.index[-1].date()}　信号日期：{signal_day}")
-    print(f"目标持仓：{', '.join(f'{s} {w:.0%}' for s, w in target.items())}")
+    as_of = closes.index[-1].date()
+    target, lev, sig_lines = aplus.compute(closes, trading_calendar(client, as_of))
+    print(f"最新数据：{as_of}　策略：{config.STRATEGY_NAME}")
+    for line in sig_lines:
+        print(line)
+    print(f"目标持仓（占本金，已含杠杆）：{', '.join(f'{s} {w:.0%}' for s, w in target.items())}")
 
     # ---- 2. 账户现状 ----
     acct = client.get_account()
@@ -110,9 +105,7 @@ def main():
     if manual_value:
         print(f"手动持仓（策略不管）：${manual_value:,.0f}")
 
-    # 风控熔断：回撤过大降杠杆；单日亏损过大当天不买
-    lev, lev_msg = risk.effective_leverage(equity)
-    print(f"风控：{lev_msg}")
+    # 风控：单日亏损过大当天不买（杠杆已由 aplus 的波动目标 + 趋势开关决定，上限 2 倍）
     day_chg = risk.daily_loss(equity, float(acct.last_equity or 0))
     no_buy = day_chg < -config.DAILY_LOSS_LIMIT
     if no_buy:
@@ -135,19 +128,18 @@ def main():
         print(f"有 {len(open_orders)} 笔订单还没成交，本次不再下单（等它们成交后再检查）")
         for o in open_orders:
             print(f"  待成交：{o.side.value} {o.qty} {o.symbol}")
-        write_status(equity, positions, target, signal_day, ["有未成交订单，跳过"], closes, risk_line=risk_line)
+        write_status(equity, positions, target, sig_lines, ["有未成交订单，跳过"], closes, risk_line=risk_line)
         return "ok"
 
     # ---- 3. 算出要买卖什么 ----
     strategy_equity = max(equity - manual_value, 0)
-    investable = strategy_equity * lev * (1 - config.CASH_BUFFER)
-    if lev > 1:
-        print(f"杠杆 {lev:g} 倍：本金 ${strategy_equity:,.0f} → 目标持仓 ${investable:,.0f}")
+    capital = strategy_equity * (1 - config.CASH_BUFFER)      # 目标权重是“占本金的比例”，已含杠杆
+    print(f"杠杆 {lev:.2f} 倍：本金 ${strategy_equity:,.0f} → 目标持仓合计 ${capital * float(target.sum()):,.0f}")
     price = closes.iloc[-1]
     orders = []
     for sym in sorted(set(positions) | set(target.index)):
         qty_now, value_now = positions.get(sym, (0.0, 0.0))
-        value_target = investable * target.get(sym, 0.0)
+        value_target = capital * target.get(sym, 0.0)
         diff = value_target - value_now
         if sym not in target.index and qty_now > 0:
             orders.append((OrderSide.SELL, sym, qty_now, "不在目标里，全部卖出"))
@@ -160,7 +152,7 @@ def main():
 
     # 资金上限：1 倍时只能用现金；加杠杆时不超过券商隔夜购买力（Reg T）
     sell_value = sum(q * price.get(s, 0) for side, s, q, _ in orders if side == OrderSide.SELL)
-    if lev > 1:
+    if lev > 1.0001:
         regt = getattr(acct, "regt_buying_power", None) or acct.buying_power
         budget = float(regt) + sell_value
     else:
@@ -214,7 +206,7 @@ def main():
     elif orders:
         print("（空跑，没有下单。加 --live 才会提交）")
 
-    write_status(equity, positions, target, signal_day, actions, closes, live, risk_line=risk_line)
+    write_status(equity, positions, target, sig_lines, actions, closes, live, risk_line=risk_line)
     return "blocked" if stopped else "ok"
 
 
@@ -241,7 +233,7 @@ def log_trade(when, sym, side, qty, ref_price, why):
         f.write(f"{when:%Y-%m-%d %H:%M},{sym},{side},{qty:g},{ref_price:.2f},{why}\n")
 
 
-def write_status(equity, positions, target, signal_day, actions, closes, live=False, risk_line=""):
+def write_status(equity, positions, target, sig_lines, actions, closes, live=False, risk_line=""):
     """生成一页状态报告，并和“同期一直持有 SPY”比较。"""
     spy_now = float(closes["SPY"].iloc[-1])
     state = {}
@@ -253,9 +245,10 @@ def write_status(equity, positions, target, signal_day, actions, closes, live=Fa
         with open(STATE_FILE, "w", encoding="utf-8") as f:
             json.dump(state, f, ensure_ascii=False, indent=2)
 
-    lines = [f"更新时间：{dt.datetime.now():%Y-%m-%d %H:%M}",
+    lines = [f"更新时间：{dt.datetime.now():%Y-%m-%d %H:%M}　策略：{config.STRATEGY_NAME}",
              f"账户净值：${equity:,.2f}",
-             f"信号日期：{signal_day}　目标：{', '.join(f'{s} {w:.0%}' for s, w in target.items())}",
+             f"目标（占本金，已含杠杆）：{', '.join(f'{s} {w:.0%}' for s, w in target.items())}",
+             *sig_lines,
              f"当前持仓：{', '.join(f'{s} {q:g}股' for s, (q, v) in positions.items()) or '无'}",
              *([f"风险：{risk_line}"] if risk_line else []),
              "本次操作：", *[f"  {a}" for a in actions]]

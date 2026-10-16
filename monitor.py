@@ -161,7 +161,7 @@ def main():
     if day < -config.DAILY_LOSS_LIMIT:
         found.append(("day_loss", f"今天已亏损 {day:.1%}"))
     if dd > config.ALERT_DRAWDOWN:
-        found.append(("drawdown", f"账户从最高点回撤 {dd:.1%}；超过 {config.DELEVER_DRAWDOWN:.0%} 会自动降到 1 倍杠杆"))
+        found.append(("drawdown", f"账户从最高点回撤 {dd:.1%}（杠杆由波动目标和 SPY 趋势开关自动控制，不会因回撤强制降杠杆）"))
 
     # 订单状态
     try:
