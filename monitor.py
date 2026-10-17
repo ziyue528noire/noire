@@ -40,6 +40,7 @@ LOG = rt("logs", "monitor_log.txt")
 MON_STATE = rt("logs", "monitor_state.json")
 SNAPSHOT = rt(config.REPORT_DIR, "monitor_last.txt")
 PAPER_LOG = rt("logs", "paper_log.txt")
+JOB_STATE = rt("logs", "paper_job_state.json")
 EMERGENCY_LOG = rt("logs", "emergency_log.txt")
 MANAGED = set(config.ROTATION_UNIVERSE + [config.CASH_SYMBOL])
 
@@ -51,16 +52,30 @@ def append(path, text):
 
 
 def check_last_run(client, found):
-    """上一次 17:00 自动换仓：有没有报错、有没有按时运行。"""
+    """上一次 17:00 自动换仓：有没有失败、有没有按时运行。"""
     if not os.path.exists(PAPER_LOG):
         return   # 还没正式运行过（第一次运行前）
-    with open(PAPER_LOG, encoding="utf-8", errors="replace") as f:
-        lines = f.read().splitlines()
-    starts = [i for i, l in enumerate(lines) if l.startswith("===== ") and "动量轮动" in l]
-    last = lines[starts[-1]:] if starts else lines[-30:]
-    if any("Traceback" in l or "Error" in l for l in last):
-        err = [l for l in last if l.strip()][-1][:150]
-        found.append(("paper_error", f"上次自动换仓出错：{err}"))
+    # 成功与否以 paper_job 的记录为准：中途重试成功不算失败（以前只要日志里出现 “Error” 字样就报警，
+    # 下载时 Yahoo 限流、重试后成功也会误报）。没有记录时（旧版本）才看日志里有没有 Traceback。
+    state = None
+    try:
+        with open(JOB_STATE, encoding="utf-8") as f:
+            state = json.load(f)
+    except Exception:
+        pass
+    if state and state.get("history"):
+        if not state.get("success"):
+            h = state["history"][-1]
+            found.append(("paper_error", f"{state.get('date')} 的自动换仓没有成功"
+                                         f"（{h.get('time', '')} {str(h.get('error', ''))[:120]}）"))
+    else:
+        with open(PAPER_LOG, encoding="utf-8", errors="replace") as f:
+            lines = f.read().splitlines()
+        starts = [i for i, l in enumerate(lines) if l.startswith("===== ") and "动量轮动" in l]
+        last = lines[starts[-1]:] if starts else lines[-30:]
+        if any("Traceback" in l for l in last):
+            err = [l for l in last if l.strip()][-1][:150]
+            found.append(("paper_error", f"上次自动换仓出错：{err}"))
     try:
         from alpaca.trading.requests import GetCalendarRequest
         today = dt.date.today()
@@ -98,6 +113,11 @@ def reconcile(client, positions, found):
     except Exception as e:
         print(f"读取订单失败：{e}")
         return
+    try:                                   # 记下成交价，给 tracking.py 对账用（失败不影响监控）
+        import fills
+        fills.record(orders, ledger.PREFIX)
+    except Exception as e:
+        print(f"记录成交价失败：{e}")
     known = ledger.submitted_ids()
     for o in orders:
         cid = getattr(o, "client_order_id", "") or ""

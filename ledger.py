@@ -7,6 +7,8 @@
   2. 提交之前先把“下单意图”写进台账（logs/order_ledger.jsonl），提交后再记结果。
   3. 提交时如果出错且无法确认结果（比如网络超时）→ 记为 UNKNOWN，立即停止后续下单，
      绝不自动重试；下次运行先向券商按编号查询，弄清楚之后才继续交易。
+  4. 券商明确拒绝（HTTP 400/403/422，例如购买力不足）→ 记为 REJECTED：订单肯定没下成，
+     报警说明原因，其余订单照常处理（2026-10-16 加；以前会被当成“结果未知”而停下）。
 """
 import os
 import json
@@ -20,6 +22,15 @@ PREFIX = "noire-"
 
 class UncertainOrder(Exception):
     """提交结果未知：可能下单成功也可能没有。必须先核实，不能重试。"""
+
+
+class RejectedOrder(Exception):
+    """券商明确拒绝（例如购买力不足、数量不对）：订单肯定没有下成，不用核实，可以继续处理其他订单。"""
+
+
+# 券商返回这些 HTTP 状态码 = 明确拒绝、订单没有建立（400 请求有误 / 403 购买力不足或没有权限 / 422 参数不对）。
+# 超时、断线、429（太频繁）、5xx 等都不算“明确”，仍按“结果未知”处理。
+DEFINITE_REJECT_STATUS = (400, 403, 422)
 
 
 def _now():
@@ -68,8 +79,17 @@ def _is_duplicate_error(e: Exception) -> bool:
     return "client_order_id" in msg and ("unique" in msg or "duplicate" in msg or "already" in msg)
 
 
+def _reason(e: Exception) -> str:
+    """券商错误信息里的 message（拿不到就用原文）。"""
+    try:
+        return str(json.loads(str(e)).get("message") or str(e))[:150]
+    except Exception:
+        return str(e)[:150]
+
+
 def submit(client, request, meta: dict):
-    """先记意图，再提交。返回券商订单对象；重复编号被拒时返回 None（说明之前已经下过）。"""
+    """先记意图，再提交。返回券商订单对象；重复编号被拒时返回 None（说明之前已经下过）。
+    券商明确拒绝 → RejectedOrder；结果不明 → UncertainOrder。"""
     cid = request.client_order_id
     record("INTENT", client_order_id=cid, **meta)
     try:
@@ -77,7 +97,17 @@ def submit(client, request, meta: dict):
     except Exception as e:
         if _is_duplicate_error(e):
             record("DUPLICATE_BLOCKED", client_order_id=cid, error=str(e)[:200])
+            try:   # 同编号的订单已经在券商那里（例如网络库自动重试过一次）→ 记下来，免得核对时误报“台账没有记录”
+                old = client.get_order_by_client_id(cid)
+                record("RESOLVED_FOUND", client_order_id=cid, broker_id=str(old.id),
+                       status=getattr(old.status, "value", str(old.status)))
+            except Exception:
+                pass
             return None
+        status = getattr(e, "status_code", None)
+        if status in DEFINITE_REJECT_STATUS:
+            record("REJECTED", client_order_id=cid, http_status=status, error=str(e)[:200])
+            raise RejectedOrder(f"{cid} 被券商拒绝：{_reason(e)}") from e
         record("UNKNOWN", client_order_id=cid, error=f"{type(e).__name__}: {str(e)[:200]}")
         raise UncertainOrder(f"{cid} 提交结果未知：{type(e).__name__}") from e
     record("SUBMITTED", client_order_id=cid, broker_id=str(o.id),
@@ -95,7 +125,7 @@ def unresolved_ids() -> list:
         ev = e["event"]
         if ev in ("INTENT", "UNKNOWN"):
             state[cid] = "open"
-        elif ev in ("SUBMITTED", "DUPLICATE_BLOCKED", "RESOLVED_FOUND", "RESOLVED_NOT_FOUND"):
+        elif ev in ("SUBMITTED", "DUPLICATE_BLOCKED", "REJECTED", "RESOLVED_FOUND", "RESOLVED_NOT_FOUND"):
             state[cid] = "done"
     return [c for c, s in state.items() if s == "open"]
 

@@ -44,6 +44,15 @@ LEVERAGE = 2.0            # 杠杆上限（券商隔夜最多 2 倍）
 LEV_FLOOR = 1.0           # 杠杆下限
 TREND_SYMBOL = "SPY"      # 趋势开关：SPY 收盘在 200 日均线下方时，杠杆最多 1 倍
 TREND_DAYS = 200
+# ===== 第二条腿：RSI(2) 超跌反弹（dipbuy.py；2026-10-16 用户同意启用，依据 research/report_v3.md）=====
+DIP_ENABLED = True        # False = 关掉第二条腿（A+ 稳健版照常）
+DIP_SYMBOL = "SPY"
+DIP_TREND_DAYS = 200      # 收盘在 200 日均线上方才买
+DIP_RSI_ENTRY = 10        # 2 日 RSI 低于 10 才买
+DIP_EXIT_DAYS = 5         # 收盘高于 5 日均线就卖
+DIP_MAX = 1.0             # 最多用 1 倍本金，而且只用 A+ 没用完的额度（总仓位不超过 LEVERAGE）
+if DIP_ENABLED:
+    STRATEGY_NAME = STRATEGY_NAME + " + 超跌反弹"     # 报告和成绩单里显示的名字
 CASH_BUFFER = 0.02       # 模拟盘留 2% 现金，避免价格跳动导致资金不足
 REBALANCE_THRESHOLD = 0.05  # 实际仓位和目标相差不到总资产 5% 就不动，省手续费
 

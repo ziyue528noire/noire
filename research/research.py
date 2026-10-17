@@ -374,7 +374,7 @@ def table(df, pct_cols, num_cols=(), int_cols=()):
             elif col in num_cols:
                 cells.append("—" if pd.isna(v) else f"{v:.2f}")
             elif col in int_cols:
-                cells.append(f"{int(v)}")
+                cells.append("—" if pd.isna(v) else f"{int(v)}")
             else:
                 cells.append(str(v))
         lines.append("| " + " | ".join(cells) + " |")

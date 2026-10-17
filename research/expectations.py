@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
-"""Noire 风险预期：A+ 稳健版“正常会亏多少、多久回本”
+"""Noire 风险预期：A+ 稳健版 + 第二条腿“正常会亏多少、多久回本”
 
   python research/expectations.py     读取 research/data/*.csv，输出 research/expectations.md
 
 做法（只做研究，不连券商）：
-  1. 用和实盘完全相同的算法（aplus.py：4 批、波动倒数、收盘价算波动、趋势开关、不借钱买现金）
-     回放 2000 年至今，借钱利率按 Alpaca 现价（国库券 + 2.5%）。
+  1. 用和实盘完全相同的算法（aplus.py：4 批、波动倒数、收盘价算波动、趋势开关、不借钱买现金；
+     2026-10-16 起加上第二条腿 dipbuy.py：SPY 的 RSI(2) 超跌反弹，只用 A+ 没用完的额度）
+     回放 2000 年至今，借钱利率按 Alpaca 现价（国库券 + 2.5%）。报告开头附“只用 A+”的对照。
      实盘的 4 批是“月末、月末前第 5/10/15 个交易日”；历史上它碰巧是较好的一种分批方式，
      所以统计时把 5 种分批方式（第 p、p+5、p+10、p+15 天，p=0~4）的结果合在一起，避免把运气当本事。
   2. 历史上每一次超过 15% 的回撤：跌了多深、跌了多久、多久回本。
@@ -22,7 +23,27 @@ HERE = r.HERE
 SPREAD = 0.025          # Alpaca 普通用户保证金 6.5% ≈ 国库券 + 2.5%
 
 
-def live_equity(spread=SPREAD, start="2000-01-03", phase=0):
+def dip_held(idx):
+    """第二条腿（SPY 的 RSI(2) 超跌反弹）在第 t 天开盘时是否持有（= 前一天收盘的信号）。
+    规则和 research_v3.s1_rsi2、实盘 dipbuy.py 完全相同：收盘在 200 日线上方且 2 日 RSI < 10 买，收盘高于 5 日均线卖。"""
+    c = pd.read_csv(os.path.join(r.DATA, "SPY.csv"), index_col=0, parse_dates=True)["Close"].dropna()
+    d = c.diff()
+    up = d.clip(lower=0).ewm(alpha=1 / 2, adjust=False).mean()
+    dn = (-d.clip(upper=0)).ewm(alpha=1 / 2, adjust=False).mean()
+    rsi = 100 - 100 / (1 + up / dn.replace(0, np.nan))
+    entry = (c > c.rolling(200).mean()) & (rsi < 10)
+    exit_ = c > c.rolling(5).mean()
+    on, out = False, []
+    for e_, x_ in zip(entry.values, exit_.values):
+        if on and x_:
+            on = False
+        elif not on and e_:
+            on = True
+        out.append(1.0 if on else 0.0)
+    return pd.Series(out, index=c.index).reindex(idx).fillna(0.0).shift(1).fillna(0.0)
+
+
+def live_equity(spread=SPREAD, start="2000-01-03", phase=0, dip=True):
     c, irx, R = v.load_universe(v.U0)
     cc = c[v.U0 + ["SHY"]].pct_change(fill_method=None)
     R2 = cc[v.U0].copy()
@@ -30,7 +51,16 @@ def live_equity(spread=SPREAD, start="2000-01-03", phase=0):
     R2 = R2.fillna(0.0)                                   # 实盘用收盘价算波动
     W = sum(v.make_W(c, v.U0, 2, "avg", "invvol", phase + 5 * j) for j in range(4)) / 4
     lev = v.lowest(v.lev_vol(W, R2, 0.30), r.lev_trend(c).reindex(W.index))
-    eq = v.simulate(W, R, irx, lev_path=lev, cash_no_borrow=True, spread=spread, start=start)
+    if dip:   # 第二条腿：剩余额度 min(1, 2 − A+ 风险仓位) 买 SPY，先用 SHY 那部分自有资金
+        T = W[v.U0].mul(lev, axis=0)
+        gross = T.sum(axis=1)
+        cash = np.minimum(W["CASH"], (1.0 - gross).clip(lower=0.0))
+        spare = (2.0 - gross).clip(0.0, 1.0) * dip_held(c.index).reindex(T.index).fillna(0.0)
+        T["SPY"] = T["SPY"] + spare
+        T["CASH"] = np.minimum(cash, (1.0 - gross - spare).clip(lower=0.0))
+        eq = v.simulate(T, R, irx, lev=1.0, spread=spread, start=start)
+    else:
+        eq = v.simulate(W, R, irx, lev_path=lev, cash_no_borrow=True, spread=spread, start=start)
     spyW = pd.DataFrame(0.0, index=c.index, columns=v.U0 + ["CASH"])
     spyW["SPY"] = 1.0
     return eq, v.simulate(spyW, R, irx, lev=1.0, start=start), irx
@@ -83,11 +113,36 @@ def pct(x, d=0):
     return f"{x * 100:+.{d}f}%" if x is not None and not (isinstance(x, float) and np.isnan(x)) else "—"
 
 
+def fmt_key(k, x):
+    if "每" in k:
+        return f"{x:.1f}"
+    if "占比" in k:
+        return f"{x * 100:.0f}%"
+    return pct(x, 1)
+
+
+def key_stats(eqs, irx):
+    """几个最要紧的数（5 种分批方式合在一起）。"""
+    ms = [v.m(e_, irx) for e_ in eqs]
+    daily = np.concatenate([e_.pct_change().dropna().values for e_ in eqs])
+    r1 = np.concatenate([rolling(e_, 252)[0] for e_ in eqs])
+    eps = [episodes(e_) for e_ in eqs]
+    yrs = (eqs[0].index[-1] - eqs[0].index[0]).days / 365.25
+    return {"年化": float(np.mean([x["年化"] for x in ms])),
+            "最大回撤（平均）": float(np.mean([x["最大回撤"] for x in ms])),
+            "最大回撤（最坏）": float(np.min([x["最大回撤"] for x in ms])),
+            "亏钱年份占比": float(np.mean(r1 < 0)), "差的年份（5% 分位）": float(np.percentile(r1, 5)),
+            "20% 以上回撤（每几年一次）": yrs / max(np.mean([int((x["最深"] <= -0.20).sum()) for x in eps]), 1e-9),
+            "单日亏 5% 以上（每年几天）": float((daily < -0.05).sum() / (len(eqs) * yrs)), "最差一天": float(daily.min())}
+
+
 def main():
     eqs = []
     for ph in range(5):
         e_, spy, irx = live_equity(phase=ph)
         eqs.append(e_)
+    eqs0 = [live_equity(phase=ph, dip=False)[0] for ph in range(5)]
+    k1, k0 = key_stats(eqs, irx), key_stats(eqs0, irx)
     eq = eqs[0]                                            # 实盘用的分批方式
     daily_all = np.vstack([e_.pct_change().fillna(0.0).values[1:] for e_ in eqs])
     daily = pd.Series(daily_all.ravel())
@@ -116,10 +171,14 @@ def main():
     rec = pd.concat([x["回本用了几个月"] for x in eps]).dropna()
     worst_dd = [x["最大回撤"] for x in ms]
 
-    L = [f"# Noire 风险预期：A+ 稳健版正常会亏多少、多久回本（数据到 {eq.index[-1].date()}）", "",
-         "> 用和实盘完全相同的算法回放 2000 年至今，借钱利率按 Alpaca 现价（国库券 + 2.5%）。只做研究，不改实盘。", "",
+    L = [f"# Noire 风险预期：A+ 稳健版 + 第二条腿正常会亏多少、多久回本（数据到 {eq.index[-1].date()}）", "",
+         "> 用和实盘完全相同的算法（A+ 稳健版 + RSI(2) 第二条腿）回放 2000 年至今，借钱利率按 Alpaca 现价（国库券 + 2.5%）。"
+         "只做研究，不改实盘。2026-10-16 起包含第二条腿（10-19 生效）；只用 A+ 的旧版数字见下面的对照表。", "",
+         "## 加上第二条腿以后有什么变化（5 种分批方式合在一起）", "",
+         "| | 只用 A+ 稳健版 | A+ 稳健版 + 第二条腿（实盘） |", "|---|---|---|",
+         *[f"| {k} | {fmt_key(k, k0[k])} | {fmt_key(k, k1[k])} |" for k in k1], "",
          "## 一句话", "",
-         f"- 这个策略历史上平均每年约 {pct(m['年化'], 1)}，但**大约每 {yrs / max(n20, 1):.0f} 年会遇到一次 20% 以上的回撤**，"
+         f"- 这个策略历史上平均每年约 {pct(m['年化'], 1)}，但**大约每 {yrs / max(n20, 1):.1f} 年会遇到一次 20% 以上的回撤**，"
          f"最深一次 {pct(max(worst_dd), 0)}~{pct(min(worst_dd), 0)}（看分批方式）；回撤 15% 以上平均每年 {n15 / yrs:.1f} 次。",
          f"- **任意一年**：中间水平 {pct(np.median(r1))}，但约 {np.mean(r1 < 0) * 100:.0f}% 的年份是亏的；"
          f"差的年份（20 年一遇）约 {pct(np.percentile(r1, 5))}。",

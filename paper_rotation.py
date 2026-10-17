@@ -17,6 +17,7 @@ import os
 import sys
 import json
 import datetime as dt
+import numpy as np
 import pandas as pd
 
 import config
@@ -25,6 +26,7 @@ import ledger
 import alerts
 import scoreboard
 import aplus
+import dipbuy
 from paths import rt, HERE
 from keys import load_keys
 from rotation import load_panel
@@ -32,7 +34,9 @@ from rotation import load_panel
 os.chdir(HERE)   # 不管从哪里启动，相对路径（data/）都指向本文件夹
 STATE_FILE = rt("paper_state.json")
 TRADE_LOG = rt("logs", "trades.csv")
+TARGETS_LOG = rt("logs", "targets.csv")
 STATUS_FILE = rt(config.REPORT_DIR, "paper_status.txt")
+DRYRUN_STATUS_FILE = rt(config.REPORT_DIR, "paper_status_dryrun.txt")   # 空跑写这里，不覆盖正式状态
 
 
 def trading_calendar(client, as_of: dt.date):
@@ -49,6 +53,38 @@ def trading_calendar(client, as_of: dt.date):
     except Exception as e:
         print(f"  (交易日历获取失败，改用工作日近似：{e})")
     return [d.date() for d in pd.bdate_range(start, end)]
+
+
+def price_sanity(closes: pd.DataFrame, max_jump=0.25):
+    """数据出错的保护：最新价格缺失、≤0，或比前一天涨跌超过 25%（这几只 ETF 历史上从来没有过，
+    多半是数据源出错，例如拆股没调整）→ 返回问题列表，调用方不交易。"""
+    problems = []
+    last, prev = closes.iloc[-1], closes.iloc[-2]
+    for s in closes.columns:
+        x, p = float(last[s]), float(prev[s])
+        if not np.isfinite(x) or x <= 0:
+            problems.append(f"{s} 最新价格是 {x}")
+        elif p > 0 and abs(x / p - 1) > max_jump:
+            problems.append(f"{s} 一天{'涨' if x > p else '跌'} {abs(x / p - 1):.0%}（{p:.2f} → {x:.2f}）")
+    return problems
+
+
+def check_data(client, last_bar: dict, as_of: dt.date, now: dt.datetime):
+    """行情是不是最新、完整？返回 (提醒行列表, 今天是不是交易日 True/False/None=不知道)。只提醒，不阻止交易。"""
+    notes = []
+    behind = sorted(s for s, d in last_bar.items() if d < as_of)
+    if behind:
+        notes.append(f"⚠ 行情不完整：{'、'.join(behind)} 没有 {as_of} 的数据（用前一天的价格代替）")
+    try:
+        from alpaca.trading.requests import GetCalendarRequest
+        cal = sorted({aplus._as_date(c.date) for c in client.get_calendar(GetCalendarRequest(start=as_of, end=now.date()))})
+    except Exception:
+        return notes, None
+    closed = [d for d in cal if d < now.date() or (d == now.date() and now.time() >= dt.time(16, 15))]
+    expected = closed[-1] if closed else as_of
+    if as_of < expected:
+        notes.append(f"⚠ 行情不是最新的：最新只有 {as_of}，应该已有 {expected} 的收盘价（本次按 {as_of} 计算）")
+    return notes, now.date() in cal
 
 
 def main():
@@ -79,18 +115,28 @@ def main():
     # ---- 1. 最新数据 + 信号 ----
     symbols = config.ROTATION_UNIVERSE + [config.CASH_SYMBOL]
     import data
-    for s in symbols:
-        data.load_prices(s, refresh=True)
+    last_bar = {s: data.load_prices(s, refresh=True).index[-1].date() for s in symbols}
     opens, closes = load_panel(symbols)
     age = (pd.Timestamp(now.date()) - closes.index[-1]).days
     if age > 5:
         sys.exit(f"数据太旧（最新一天是 {closes.index[-1].date()}），为安全起见不操作")
+    bad_px = price_sanity(closes)
+    if bad_px:
+        sys.exit("行情数据异常，为安全起见不操作：" + "；".join(bad_px))
     as_of = closes.index[-1].date()
+    data_notes, trading_today = check_data(client, last_bar, as_of, now)
     target, lev, sig_lines = aplus.compute(closes, trading_calendar(client, as_of))
+    target, dip, dip_lines = dipbuy.compute(closes, target)      # 第二条腿：只用 A+ 没用完的额度
+    sig_lines = data_notes + sig_lines + dip_lines
+    if data_notes and live:
+        alerts.add("自动换仓：" + "；".join(n.lstrip("⚠ ") for n in data_notes))
     print(f"最新数据：{as_of}　策略：{config.STRATEGY_NAME}")
     for line in sig_lines:
         print(line)
     print(f"目标持仓（占本金，已含杠杆）：{', '.join(f'{s} {w:.0%}' for s, w in target.items())}")
+    gross_target = float(sum(w for s, w in target.items() if s != config.CASH_SYMBOL))
+    if live:
+        log_targets(as_of, lev, target, dip)
 
     # ---- 2. 账户现状 ----
     acct = client.get_account()
@@ -117,7 +163,7 @@ def main():
                  f"距追缴保证金 {'—（没借钱）' if gross_now <= equity else f'再跌 {dist:.0%}'}")
     print(f"风控：{risk_line}")
 
-    if live:   # 成绩单：每天记一行（第一次会先补上起点那一天）
+    if live and trading_today is not False:   # 成绩单：每个交易日记一行（休市日不记；第一次会先补上起点那一天）
         gross = sum(v for q, v in all_pos.values())
         record_score(now.date(), equity, float(closes["SPY"].iloc[-1]),
                      gross / equity if equity else 0, risk.update_peak(equity)["drawdown"])
@@ -128,13 +174,14 @@ def main():
         print(f"有 {len(open_orders)} 笔订单还没成交，本次不再下单（等它们成交后再检查）")
         for o in open_orders:
             print(f"  待成交：{o.side.value} {o.qty} {o.symbol}")
-        write_status(equity, positions, target, sig_lines, ["有未成交订单，跳过"], closes, risk_line=risk_line)
+        write_status(equity, positions, target, sig_lines, ["有未成交订单，跳过"], closes, live, risk_line=risk_line)
         return "ok"
 
     # ---- 3. 算出要买卖什么 ----
     strategy_equity = max(equity - manual_value, 0)
     capital = strategy_equity * (1 - config.CASH_BUFFER)      # 目标权重是“占本金的比例”，已含杠杆
-    print(f"杠杆 {lev:.2f} 倍：本金 ${strategy_equity:,.0f} → 目标持仓合计 ${capital * float(target.sum()):,.0f}")
+    print(f"A+ 杠杆 {lev:.2f} 倍{f' + 第二条腿 {dip:.2f} 倍' if dip > 0 else ''}：本金 ${strategy_equity:,.0f} → "
+          f"目标持仓合计 ${capital * float(target.sum()):,.0f}（风险资产 {gross_target:.2f} 倍）")
     price = closes.iloc[-1]
     orders = []
     for sym in sorted(set(positions) | set(target.index)):
@@ -145,22 +192,34 @@ def main():
             orders.append((OrderSide.SELL, sym, qty_now, "不在目标里，全部卖出"))
         elif abs(diff) > equity * config.REBALANCE_THRESHOLD and sym in price:
             qty = int(abs(diff) // price[sym])
+            if diff < 0:
+                qty = min(qty, int(qty_now))      # 卖出永远不超过持有的股数（绝不做空）
             if qty > 0:
                 side = OrderSide.BUY if diff > 0 else OrderSide.SELL
-                orders.append((side, sym, qty, f"调到目标 {target.get(sym, 0):.0%}"))
+                why = f"调到目标 {target.get(sym, 0):.0%}"
+                if sym == config.DIP_SYMBOL and dip > 0:
+                    why += f"（其中第二条腿 {dip:.0%}）"
+                orders.append((side, sym, qty, why))
     orders.sort(key=lambda o: o[0] != OrderSide.SELL)   # 先卖后买
 
-    # 资金上限：1 倍时只能用现金；加杠杆时不超过券商隔夜购买力（Reg T）
+    # 资金上限：1 倍时只能用现金；加杠杆时不超过券商隔夜购买力（Reg T，卖单成交后）
     sell_value = sum(q * price.get(s, 0) for side, s, q, _ in orders if side == OrderSide.SELL)
-    if lev > 1.0001:
+    if gross_target > 1.0001:                                  # 目标里有借钱的部分（A+ 杠杆或第二条腿）
         regt = getattr(acct, "regt_buying_power", None) or acct.buying_power
         budget = float(regt) + sell_value
     else:
         budget = cash + sell_value - equity * config.CASH_BUFFER / 2
+    why_short = "资金不够"
+    # 券商检查买单时，还没成交的卖单不算进购买力（Alpaca 规则）→ 买单总额也不能超过券商“现在”的购买力，
+    # 否则会被拒绝。超出的部分等卖单成交后，下一次运行自动补上。
+    bp_now = getattr(acct, "buying_power", None)
+    if bp_now is not None and float(bp_now) * 0.97 < budget:
+        budget = max(float(bp_now) * 0.97, 0.0)
+        why_short = "券商现在的购买力不够（卖单成交前，卖出的钱不算进购买力）"
     buy_value = sum(q * price.get(s, 0) for side, s, q, _ in orders if side == OrderSide.BUY)
     if buy_value > budget > 0:
         ratio = budget / buy_value
-        print(f"资金不够（需要 ${buy_value:,.0f}，可用 ${budget:,.0f}），买单按 {ratio:.0%} 缩小")
+        print(f"{why_short}（需要 ${buy_value:,.0f}，可用 ${budget:,.0f}），买单按 {ratio:.0%} 缩小，剩下的下一次运行再补")
         orders = [(sd, s, int(q * ratio) if sd == OrderSide.BUY else q, w) for sd, s, q, w in orders]
         orders = [o for o in orders if o[2] > 0]
     elif buy_value > 0 and budget <= 0:
@@ -193,6 +252,12 @@ def main():
             actions.append(f"{line}　✗ 结果不明，已停止")
             stopped = True
             break
+        except ledger.RejectedOrder as e:
+            msg = f"自动换仓：{e}。这笔没有下成（其余订单照常），下一次运行会按最新仓位重新计算"
+            print("  ✗ " + msg)
+            alerts.add(msg)
+            actions.append(f"{line}　✗ 被券商拒绝")
+            continue
         if o is None:
             print(f"    （编号 {cid} 今天已经下过，券商拒绝重复，跳过）")
             actions.append(f"{line}　（今天已下过，跳过）")
@@ -224,6 +289,21 @@ def record_score(day, equity, spy_close, leverage, drawdown):
         print(f"成绩单记录失败（不影响交易）：{e}")
 
 
+def log_targets(as_of, lev, target, dip=0.0):
+    """每次正式运行记下当天算出的目标（tracking.py 用它算“按策略应该赚多少”）。失败不影响交易。
+    weights 是合并后的目标（含第二条腿）；dip 是其中第二条腿另外加的 SPY（占本金），单独记账用。"""
+    try:
+        os.makedirs(os.path.dirname(TARGETS_LOG), exist_ok=True)
+        new = not os.path.exists(TARGETS_LOG)
+        with open(TARGETS_LOG, "a", encoding="utf-8") as f:
+            if new:
+                f.write("as_of,run_time,leverage,cash_buffer,weights,dip\n")
+            weights = "|".join(f"{s}={float(w):.6f}" for s, w in target.items())     # 例：QQQ=0.870000|EEM=0.570000
+            f.write(f"{as_of},{dt.datetime.now():%Y-%m-%d %H:%M},{lev:.4f},{config.CASH_BUFFER},{weights},{dip:.6f}\n")
+    except Exception as e:
+        print(f"记录目标失败（不影响交易）：{e}")
+
+
 def log_trade(when, sym, side, qty, ref_price, why):
     os.makedirs(os.path.dirname(TRADE_LOG), exist_ok=True)
     new = not os.path.exists(TRADE_LOG)
@@ -234,7 +314,8 @@ def log_trade(when, sym, side, qty, ref_price, why):
 
 
 def write_status(equity, positions, target, sig_lines, actions, closes, live=False, risk_line=""):
-    """生成一页状态报告，并和“同期一直持有 SPY”比较。"""
+    """生成一页状态报告，并和“同期一直持有 SPY”比较。
+    正式运行写 paper_status.txt；空跑写 paper_status_dryrun.txt（以前空跑会覆盖正式状态，日报/周报会读错）。"""
     spy_now = float(closes["SPY"].iloc[-1])
     state = {}
     if os.path.exists(STATE_FILE):
@@ -245,7 +326,8 @@ def write_status(equity, positions, target, sig_lines, actions, closes, live=Fal
         with open(STATE_FILE, "w", encoding="utf-8") as f:
             json.dump(state, f, ensure_ascii=False, indent=2)
 
-    lines = [f"更新时间：{dt.datetime.now():%Y-%m-%d %H:%M}　策略：{config.STRATEGY_NAME}",
+    lines = [f"更新时间：{dt.datetime.now():%Y-%m-%d %H:%M}　策略：{config.STRATEGY_NAME}"
+             + ("" if live else "　【空跑，没有下单】"),
              f"账户净值：${equity:,.2f}",
              f"目标（占本金，已含杠杆）：{', '.join(f'{s} {w:.0%}' for s, w in target.items())}",
              *sig_lines,
@@ -257,8 +339,9 @@ def write_status(equity, positions, target, sig_lines, actions, closes, live=Fal
         spy = spy_now / state["spy_start"] - 1
         lines += ["", f"自 {state['start_date']} 起：策略 {mine:+.2%}　同期 SPY {spy:+.2%}　"
                       f"{'领先' if mine >= spy else '落后'} {abs(mine - spy):.2%}"]
-    os.makedirs(os.path.dirname(STATUS_FILE), exist_ok=True)
-    with open(STATUS_FILE, "w", encoding="utf-8") as f:
+    path = STATUS_FILE if live else DRYRUN_STATUS_FILE
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
 
 

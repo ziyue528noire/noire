@@ -33,6 +33,14 @@ class _Status:
         self.value = v
 
 
+class FakeAPIError(Exception):
+    """模仿 alpaca-py 的 APIError：str() 是券商返回的 JSON，status_code 是 HTTP 状态码。"""
+
+    def __init__(self, text, status_code):
+        super().__init__(text)
+        self.status_code = status_code
+
+
 class _Req:
     def __init__(self, **kw):
         self.client_order_id = None
@@ -73,10 +81,11 @@ class Broker:
         self.cash = 100000.0
         self.last_equity = 100000.0
         self.regt_buying_power = 200000.0
+        self.buying_power = None     # None = 按 regt 的 2 倍；设了数字就用它（模拟券商“现在”的购买力）
         self.maintenance_margin = 0.0
         self.positions = {}          # symbol -> (qty, market_value)
         self.orders = []             # 订单对象列表
-        self.fail_next_submit = None # None / "lost_response" / "not_received"
+        self.fail_next_submit = None # None / "lost_response" / "not_received" / "rejected"（券商明确拒绝）
         self.lookup_error = False    # True = 按编号查询时网络出错
         self.is_open = False
         self.paper_flags = []
@@ -108,7 +117,8 @@ class TradingClient:
         b = BROKER
         lmv = sum(v for q, v in b.positions.values())
         return NS(equity=str(b.equity), cash=str(b.cash), last_equity=str(b.last_equity),
-                  buying_power=str(b.regt_buying_power * 2), regt_buying_power=str(b.regt_buying_power),
+                  buying_power=str(b.regt_buying_power * 2 if b.buying_power is None else b.buying_power),
+                  regt_buying_power=str(b.regt_buying_power),
                   long_market_value=str(lmv), short_market_value="0",
                   maintenance_margin=str(b.maintenance_margin), status="ACTIVE", trading_blocked=False)
 
@@ -132,6 +142,8 @@ class TradingClient:
         mode, b.fail_next_submit = b.fail_next_submit, None
         if mode == "not_received":
             raise TimeoutError("read timed out")
+        if mode == "rejected":
+            raise FakeAPIError('{"code":40310000,"message":"insufficient buying power"}', 403)
         o = b.add_order(req.symbol, req.side.value, req.qty, "accepted", cid)
         if getattr(req, "limit_price", None):
             o.limit_price = str(req.limit_price)
