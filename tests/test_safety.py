@@ -305,6 +305,13 @@ class SafetyTests(unittest.TestCase):
             trade.place(c, ("k", "s"))
         return buf.getvalue()
 
+    def test_status_shows_fill_time_not_queue_time(self):
+        # 收盘后排队的单，券商的“提交时间”是第二天 08:00（UTC）；状态里应该显示成交时间（本地时间）
+        sub = dt.datetime(2026, 10, 19, 8, 0, tzinfo=dt.timezone.utc)
+        fil = dt.datetime(2026, 10, 19, 13, 35, tzinfo=dt.timezone.utc)
+        self.assertEqual(trade.when_text(fakebroker.NS(submitted_at=sub, filled_at=fil)), f"{fil.astimezone():%m-%d %H:%M}")
+        self.assertEqual(trade.when_text(fakebroker.NS(submitted_at=sub, filled_at=None)), f"{sub.astimezone():%m-%d %H:%M}")
+
     def test_manual_rules(self):
         B.cash = 5000
         B.positions = {"NVDA": (2, 400)}
@@ -382,6 +389,44 @@ class SafetyTests(unittest.TestCase):
         self.assertAlmostEqual(s["total"], 0.02)
         self.assertAlmostEqual(s["spy"], 0.01)
 
+    def _run_with_data_notes(self, notes):
+        # 券商 17:00 的市值含盘后价格（QQQ 160、EEM 99），而当天收盘价都是 100
+        B.equity, B.cash, B.last_equity = 100000, -15000, 100000
+        B.positions = {"QQQ": (100, 16000), "EEM": (1000, 99000)}
+        orig = paper_rotation.check_data
+        paper_rotation.check_data = lambda *a, **k: (notes, True)      # 固定成“今天是交易日”，不依赖今天星期几
+        try:
+            run(paper_rotation.main, "--live")
+        finally:
+            paper_rotation.check_data = orig
+        return scoreboard.read(scoreboard.HISTORY)[-1]
+
+    def test_scoreboard_records_closing_equity(self):
+        row = self._run_with_data_notes([])
+        want = -15000 + 100 * last_price("QQQ") + 1000 * last_price("EEM")
+        self.assertEqual(row["equity"], f"{want:.2f}")                   # 收盘净值：现金 + 持仓 × 收盘价
+        self.assertEqual(row["broker_equity"], "100000.00")              # 17:00 的券商净值另记一列
+
+    def test_scoreboard_uses_broker_equity_when_data_not_current(self):
+        row = self._run_with_data_notes(["⚠ 行情不是最新的：最新只有昨天"])
+        self.assertEqual(row["equity"], "100000.00")                     # 收盘价不可靠 → 用券商净值
+
+    def test_close_equity_falls_back_to_broker_value_for_unknown_symbols(self):
+        last = pd.Series({"QQQ": 100.0})
+        self.assertAlmostEqual(paper_rotation.close_equity(-500, {"QQQ": (10, 1200), "NVDA": (2, 300)}, last),
+                               -500 + 10 * 100 + 300)
+
+    def test_scoreboard_head_to_head_uses_common_dates(self):
+        a = [{"date": "2026-01-02", "equity": "100"}, {"date": "2026-01-05", "equity": "110"},
+             {"date": "2026-01-06", "equity": "121"}]
+        b = [{"date": "2025-12-30", "equity": "50"}, {"date": "2026-01-02", "equity": "60"},
+             {"date": "2026-01-05", "equity": "66"}]
+        line = scoreboard.overlap_line({"甲（说明）": a, "乙": b}, {"2026-01-02": 500.0, "2026-01-05": 505.0})
+        self.assertEqual(line, "同场比较（共同区间 2026-01-02~2026-01-05）：甲 +10.00%　乙 +10.00%　同期 SPY +1.00%")
+        self.assertIsNone(scoreboard.overlap_line({"甲": a}, {}))                     # 只有一个系统：不比
+        self.assertIsNone(scoreboard.overlap_line({"甲": a[:2], "乙": [{"date": "2026-01-05", "equity": "1"},
+                                                                       {"date": "2026-01-09", "equity": "2"}]}, {}))
+
     def test_shared_scoreboard_writes_only_own_file(self):
         os.makedirs(scoreboard.SHARED_DIR, exist_ok=True)
         self.assertTrue(scoreboard.SHARED_DIR.startswith(TMP))           # 测试绝不碰真实 D:\\scoreboard
@@ -400,6 +445,8 @@ class SafetyTests(unittest.TestCase):
         with open(other, encoding="utf-8") as f:
             self.assertEqual(f.read(), before)                          # 对方文件原封不动
         self.assertIn("ChatGPT", buf.getvalue())
+        self.assertIn("同场比较（共同区间 2026-01-02~2026-01-05）：Noire 动量轮动 +2.00%　ChatGPT 盘中学习系统 +0.10%",
+                      buf.getvalue())
 
     # ---------- 有限次数自动重试 ----------
     def _job(hour, minute):
@@ -652,7 +699,9 @@ class TrackingTests(unittest.TestCase):
         sl = tracking.slippage(root)
         self.assertEqual(len(sl), 1)                                          # 部分成交 + 全部成交只算一笔
         self.assertAlmostEqual(float(sl["bps"].iloc[0]), 10.0, places=3)     # 比开盘价贵 0.1% = 10 个基点
-        self.assertIn("对账天数 10", tracking.report(root))
+        text = tracking.report(root)
+        self.assertIn("对账天数 10", text)
+        self.assertIn("按金额加权 +10.0 个基点", text)
 
     def test_tracking_attributes_second_leg(self):
         root = os.path.join(TMP, "trackroot2")
@@ -867,6 +916,42 @@ class DataAndMonitorTests(unittest.TestCase):
         self.assertEqual(len(calls), data.DOWNLOAD_TRIES)
         self.assertIn("本地缓存没有改动", str(cm.exception))
         self.assertIsNone(data._problem(self.frame("2010-01-04", 301), old))   # 多一天新数据是正常的
+
+    def test_cache_write_is_atomic_and_leaves_no_temp_file(self):
+        # 模拟盘和实盘共用 data\ 缓存：先写临时文件再整体替换，别的程序读到的永远是完整文件
+        d = tempfile.mkdtemp(dir=TMP)
+        path = os.path.join(d, "SPY.csv")
+        self.frame("2010-01-04", 5).to_csv(path)
+        self.fake_yf([self.frame("2010-01-04", 300)])
+        old_dir, config.DATA_DIR = config.DATA_DIR, d
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                df = _orig_load("SPY", True)              # 真的走一遍“下载 → 写缓存”（假 yfinance）
+        finally:
+            config.DATA_DIR = old_dir
+        self.assertEqual(len(df), 300)
+        self.assertEqual(len(pd.read_csv(path, index_col=0)), 300)
+        self.assertEqual(os.listdir(d), ["SPY.csv"])           # 没有留下临时文件
+
+    def test_cache_write_retries_when_file_is_busy(self):
+        d = tempfile.mkdtemp(dir=TMP)
+        path = os.path.join(d, "SPY.csv")
+        real, calls = os.replace, []
+
+        def busy_once(a, b):
+            calls.append(b)
+            if len(calls) == 1:
+                raise PermissionError("另一个程序正在读这个文件")
+            return real(a, b)
+        data.os.replace = busy_once
+        try:
+            data._save(self.frame("2010-01-04", 10), path)
+        finally:
+            data.os.replace = real
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(self.waits, [1])
+        self.assertEqual(len(pd.read_csv(path, index_col=0)), 10)
+        self.assertEqual(os.listdir(d), ["SPY.csv"])
 
     def _last_run_findings(self, state):
         os.makedirs(os.path.dirname(monitor.PAPER_LOG), exist_ok=True)

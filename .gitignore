@@ -1,7 +1,9 @@
 # secrets
 .env
 .env.txt
+.env.live
 # runtime data (not code)
+live/
 data/
 logs/
 orders/

@@ -89,12 +89,14 @@ class Broker:
         self.lookup_error = False    # True = 按编号查询时网络出错
         self.is_open = False
         self.paper_flags = []
+        self.allow_live = False      # 实盘模式的测试才设 True；否则一旦连实盘就直接报错
         self.price = 100.0
 
     # —— 测试辅助 ——
-    def add_order(self, symbol, side, qty, status="accepted", client_order_id=None, when=None):
+    def add_order(self, symbol, side, qty, status="accepted", client_order_id=None, when=None, notional=None):
         o = NS(id=str(uuid.uuid4()), client_order_id=client_order_id or str(uuid.uuid4()),
-               symbol=symbol, qty=str(qty), side=OrderSide(side), status=_Status(status),
+               symbol=symbol, qty=None if qty is None else str(qty),
+               notional=None if notional is None else str(notional), side=OrderSide(side), status=_Status(status),
                order_type=_Status("market"), limit_price=None, filled_qty="0", filled_avg_price=None,
                submitted_at=when or dt.datetime.now(dt.timezone.utc))
         self.orders.append(o)
@@ -110,7 +112,7 @@ BROKER = Broker()
 class TradingClient:
     def __init__(self, key, secret, paper=True):
         BROKER.paper_flags.append(paper)
-        if paper is not True:
+        if paper is not True and not BROKER.allow_live:
             raise AssertionError("测试发现程序试图连接实盘！")
 
     def get_account(self):
@@ -144,7 +146,8 @@ class TradingClient:
             raise TimeoutError("read timed out")
         if mode == "rejected":
             raise FakeAPIError('{"code":40310000,"message":"insufficient buying power"}', 403)
-        o = b.add_order(req.symbol, req.side.value, req.qty, "accepted", cid)
+        o = b.add_order(req.symbol, req.side.value, getattr(req, "qty", None), "accepted", cid,
+                        notional=getattr(req, "notional", None))
         if getattr(req, "limit_price", None):
             o.limit_price = str(req.limit_price)
             o.order_type = _Status("limit")

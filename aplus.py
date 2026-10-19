@@ -107,9 +107,11 @@ def base_weights(closes: pd.DataFrame, trading_days, as_of=None):
     return total / len(config.TRANCHE_OFFSETS), notes
 
 
-def leverage(closes: pd.DataFrame, base: pd.Series):
+def leverage(closes: pd.DataFrame, base: pd.Series, max_lev=None):
     """杠杆 = 波动目标 ÷ 组合近 63 天年化波动（1~LEVERAGE 倍）；SPY 在 200 日线下方时最多 1 倍。
+    max_lev：实盘另设的杠杆上限（不超过 LEVERAGE、不低于 LEV_FLOOR）；None = 模拟盘，和以前一样。
     返回 (杠杆, 说明, 详细数据)。"""
+    cap = config.LEVERAGE if max_lev is None else max(config.LEV_FLOOR, min(float(max_lev), config.LEVERAGE))
     cols = [s for s in base.index if base[s] > 0]
     rets = closes[cols].pct_change().iloc[-config.VOL_WINDOW:]
     detail = {"vol": None, "trend_ok": False, "spy": None, "sma": None}
@@ -118,8 +120,11 @@ def leverage(closes: pd.DataFrame, base: pd.Series):
     else:
         vol = float((rets @ base[cols]).std(ddof=1)) * math.sqrt(252)
         detail["vol"] = vol
-        vol_lev = config.LEV_FLOOR if vol <= 0 else min(config.LEVERAGE, max(config.LEV_FLOOR, config.VOL_TARGET / vol))
-        vol_msg = f"组合近{config.VOL_WINDOW}天波动 {vol:.1%} → {config.VOL_TARGET:.0%}÷波动 = {vol_lev:.2f} 倍"
+        raw = config.LEV_FLOOR if vol <= 0 else min(config.LEVERAGE, max(config.LEV_FLOOR, config.VOL_TARGET / vol))
+        vol_lev = min(raw, cap)
+        vol_msg = f"组合近{config.VOL_WINDOW}天波动 {vol:.1%} → {config.VOL_TARGET:.0%}÷波动 = {raw:.2f} 倍"
+        if vol_lev < raw - 1e-9:
+            vol_msg += f"，实盘上限 {cap:.2f} 倍"
     spy = closes[config.TREND_SYMBOL].dropna()
     if len(spy) >= config.TREND_DAYS:
         last, sma = float(spy.iloc[-1]), float(spy.iloc[-config.TREND_DAYS:].mean())
@@ -143,12 +148,12 @@ def final_weights(base: pd.Series, lev: float) -> pd.Series:
     return w[w > 1e-9]
 
 
-def compute(closes: pd.DataFrame, trading_days, as_of=None):
-    """一站式：返回 (最终目标权重, 杠杆, 说明行列表)。"""
+def compute(closes: pd.DataFrame, trading_days, as_of=None, max_lev=None):
+    """一站式：返回 (最终目标权重, 杠杆, 说明行列表)。max_lev：实盘杠杆上限（None = 模拟盘）。"""
     as_of = closes.index[-1] if as_of is None else pd.Timestamp(as_of)
     c = closes.loc[:as_of]
     base, notes = base_weights(c, trading_days, as_of)
-    lev, lev_msg, _ = leverage(c, base)
+    lev, lev_msg, _ = leverage(c, base, max_lev)
     target = final_weights(base, lev)
     lines = ["四批信号：", *[f"  {n}" for n in notes],
              f"合并后（未加杠杆）：{', '.join(f'{s} {v:.0%}' for s, v in base[base > 1e-9].items())}",

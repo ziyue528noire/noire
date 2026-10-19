@@ -2,6 +2,7 @@
 chcp 65001 >nul
 cd /d "%~dp0"
 set PYTHONUTF8=1
+set "NOIRE_PROFILE="
 echo ================================================
 echo   Alpaca paper-trading key setup
 echo   Keys are saved ONLY to this folder (.env).

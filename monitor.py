@@ -18,6 +18,7 @@
 
   python monitor.py        正常检查
   python monitor.py test   只发一条测试通知
+实盘（NOIRE_PROFILE=live，run_live_monitor.bat）检查的是实盘账户，记录写在 live\\ 子文件夹；只读连接，不能下单。
 """
 import os
 import sys
@@ -30,6 +31,8 @@ os.chdir(HERE)
 sys.path.insert(0, HERE)
 
 import config
+import runmode
+import broker
 import risk
 import ledger
 import alerts
@@ -128,7 +131,7 @@ def reconcile(client, positions, found):
         if not cid.startswith(ledger.PREFIX):
             if emergency_recent:
                 continue   # 紧急停止的清仓单由券商生成编号，属于正常
-            found.append((f"foreign_{o.id}", f"发现不是本系统提交的订单：{o.side.value} {o.qty} {o.symbol}"
+            found.append((f"foreign_{o.id}", f"发现不是本系统提交的订单：{o.side.value} {ledger.size_text(o)} {o.symbol}"
                                              f"（{status}）。是你在网页/App 上手动下的吗？"))
         elif status in ("filled", "partially_filled") and cid not in known:
             found.append((f"unlogged_{cid}", f"订单 {cid} 已成交，但本地台账没有提交记录，请核对"))
@@ -148,11 +151,10 @@ def main():
         found.append(("no_keys", "找不到 Alpaca 密钥，所有自动交易都无法运行"))
         return finish(now, found, ["无法连接"])
 
-    from alpaca.trading.client import TradingClient
     from alpaca.trading.requests import GetOrdersRequest
     from alpaca.trading.enums import QueryOrderStatus
     try:
-        client = TradingClient(key, secret, paper=True)
+        client = broker.client(key, secret, trading=False)     # 只读：监控从不下单
         clock = client.get_clock()
         acct = client.get_account()
         pos_list = client.get_all_positions()
@@ -162,6 +164,10 @@ def main():
 
     if risk.is_stopped():
         notes.append("紧急停止中（STOP 文件存在）")
+    if runmode.IS_LIVE:
+        ok, why = broker.live_trading_ready()
+        if not ok:
+            notes.append(f"实盘自动交易没有打开（{why}）")
 
     equity = float(acct.equity)
     last_equity = float(acct.last_equity or 0)
@@ -189,12 +195,12 @@ def main():
         cutoff = clock.timestamp - dt.timedelta(days=2)
         for o in recent:
             if o.submitted_at and o.submitted_at > cutoff and o.status.value in ("rejected", "canceled", "expired"):
-                found.append((f"order_{o.id}", f"订单{o.status.value}：{o.side.value} {o.qty} {o.symbol}"))
+                found.append((f"order_{o.id}", f"订单{o.status.value}：{o.side.value} {ledger.size_text(o)} {o.symbol}"))
         et = clock.timestamp
         if clock.is_open and et.hour * 60 + et.minute >= 600:   # 美东 10:00 以后
             for o in client.get_orders(GetOrdersRequest(status=QueryOrderStatus.OPEN)):
                 if o.order_type.value == "market" and o.submitted_at < et - dt.timedelta(minutes=30):
-                    found.append((f"stuck_{o.id}", f"市价单开盘后仍未成交：{o.side.value} {o.qty} {o.symbol}"))
+                    found.append((f"stuck_{o.id}", f"市价单开盘后仍未成交：{o.side.value} {ledger.size_text(o)} {o.symbol}"))
     except Exception as e:
         print(f"检查订单失败：{e}")
 
@@ -226,7 +232,7 @@ def finish(now, found, info_lines):
     for k, m in new:
         alerts.add(m, popup=False)
     if new:
-        alerts.notify("Noire 交易警报", "；".join(m for _, m in new))
+        alerts.notify(alerts.TITLE, "；".join(m for _, m in new))
     state = {today: sent + [k for k, _ in new]}
     os.makedirs(os.path.dirname(MON_STATE), exist_ok=True)
     with open(MON_STATE, "w", encoding="utf-8") as f:
@@ -254,4 +260,4 @@ if __name__ == "__main__":
         err = traceback.format_exc()
         print(err)
         append(LOG, f"{dt.datetime.now():%m-%d %H:%M}  监控程序出错：{err.strip().splitlines()[-1]}")
-        alerts.notify("Noire 监控出错", err.strip().splitlines()[-1][:200])
+        alerts.notify(f"Noire {runmode.LABEL}监控出错", err.strip().splitlines()[-1][:200])

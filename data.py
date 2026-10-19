@@ -5,6 +5,8 @@
   - Yahoo 偶尔限流或临时出错 → 同一次运行里自动再试 2 次（先等 20 秒、再等 60 秒）
   - 新下载的数据明显比本地缓存少（开头晚了很多、少了很多天、或者最新日期倒退）→ 当作下载失败，
     不覆盖本地缓存（否则动量会因为“历史不够”而全部换成现金）
+实盘准备（2026-10-18）：模拟盘和实盘共用 data\\ 缓存 → 写缓存时先写临时文件再整体替换，
+    两边前后脚运行时也不会读到写了一半的文件。
 """
 import os
 import time
@@ -52,6 +54,21 @@ def _download(symbol: str, old: pd.DataFrame = None) -> pd.DataFrame:
     raise RuntimeError(f"{symbol} 下载 {DOWNLOAD_TRIES} 次都没成功（{why}），本地缓存没有改动")
 
 
+def _save(df: pd.DataFrame, path: str, tries: int = 5):
+    """先写临时文件再整体替换：别的程序（例如模拟盘和实盘的换仓前后脚运行）任何时候读到的都是完整文件。
+    Windows 上目标文件正被别的程序读的那一瞬间替换会失败 → 等 1 秒再试。"""
+    tmp = f"{path}.{os.getpid()}.tmp"
+    df.to_csv(tmp)
+    for i in range(tries):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError:
+            if i == tries - 1:
+                raise
+            time.sleep(1)
+
+
 def load_prices(symbol: str, refresh: bool = False) -> pd.DataFrame:
     """返回包含 Open/High/Low/Close/Volume 的日线 DataFrame（已复权）。
     第一次会联网下载并存到 data/ 文件夹，之后直接读本地缓存；refresh=True 时重新下载。"""
@@ -69,7 +86,7 @@ def load_prices(symbol: str, refresh: bool = False) -> pd.DataFrame:
                 old = None
         print(f"下载 {symbol} ...")
         df = _download(symbol, old)
-        df.to_csv(path)
+        _save(df, path)
 
     df = df.loc[config.START:]
     if config.END:

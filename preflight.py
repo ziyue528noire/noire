@@ -17,7 +17,8 @@ LOG = rt("logs", "tests_last.txt")
 
 
 def main() -> int:
-    env = {k: v for k, v in os.environ.items() if k != "EXC_RUNTIME_DIR"}
+    # 测试永远在模拟盘模式、临时目录里跑（实盘任务调用自检时也一样），绝不碰真实账户和文件
+    env = {k: v for k, v in os.environ.items() if k not in ("EXC_RUNTIME_DIR", "NOIRE_PROFILE")}
     r = subprocess.run([sys.executable, "-m", "unittest", "discover", "-s", "tests"],
                        cwd=HERE, capture_output=True, text=True, encoding="utf-8",
                        errors="replace", env=env, timeout=600)

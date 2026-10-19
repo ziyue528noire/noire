@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""手动下单通道（只连 Alpaca 模拟盘）
+"""手动下单通道（只用于 Alpaca 模拟盘）
 
   python trade.py status   查看账户、持仓、盈亏、未成交订单 → orders/status.txt
   python trade.py place    执行 orders/order.json 里的订单   → orders/result.txt
@@ -16,7 +16,8 @@ order.json 格式示例：
 }
 
 安全规则（写死在代码里）：
-  - 只连模拟盘（paper=True）
+  - 手动下单只能在模拟盘用；实盘（NOIRE_PROFILE=live）只能查看状态，place 一律拒绝
+    （Claude 不替用户下真钱订单；要手动交易真钱账户，请在 Alpaca 网页上自己操作）
   - 不借钱：买入金额不能超过可用现金
   - 不做空：卖出数量不能超过持有数量
   - order.json 执行后立刻移到 orders/done/，不会被重复执行
@@ -30,6 +31,8 @@ import datetime as dt
 from keys import load_keys
 
 import hashlib
+import runmode
+import broker
 import ledger
 import alerts
 from paths import rt
@@ -39,12 +42,11 @@ ORDER_FILE = os.path.join(ORD_DIR, "order.json")
 TRADE_LOG = rt("logs", "trades.csv")
 
 
-def get_clients():
+def get_clients(trading=False):
     key, secret = load_keys()
     if not key or not secret:
-        sys.exit("没找到密钥：请先双击 set_keys.bat")
-    from alpaca.trading.client import TradingClient
-    return TradingClient(key, secret, paper=True), (key, secret)   # 只连模拟盘
+        sys.exit("没找到实盘密钥：请先双击 set_live_keys.bat" if runmode.IS_LIVE else "没找到密钥：请先双击 set_keys.bat")
+    return broker.client(key, secret, trading=trading), (key, secret)   # 模拟盘；实盘只读
 
 
 def latest_price(sym, keys):
@@ -64,7 +66,20 @@ def fmt_order(o):
     if getattr(o, "filled_qty", None) and float(o.filled_qty) > 0:
         filled = f"，已成交 {float(o.filled_qty):g} 股 @ ${float(o.filled_avg_price):.2f}"
     side = "买入" if o.side.value == "buy" else "卖出"
-    return f"{side} {o.symbol} {float(o.qty or 0):g} 股{px}　状态：{o.status.value}{filled}"
+    return f"{side} {o.symbol} {ledger.size_text(o)}{px}　状态：{o.status.value}{filled}"
+
+
+def when_text(o) -> str:
+    """订单时间（电脑本地时间 = 美东）：成交了的显示成交时间，没成交的显示提交时间。
+    以前显示的是券商的“提交时间”（UTC），收盘后排队的单会显示成第二天 08:00，看起来像早上 8 点下的单。"""
+    t = getattr(o, "filled_at", None) or getattr(o, "submitted_at", None)
+    if t is None:
+        return "--"
+    try:
+        t = t.astimezone() if getattr(t, "tzinfo", None) else t
+        return f"{t:%m-%d %H:%M}"
+    except Exception:
+        return str(t)[:16]
 
 
 def status(client, keys, out=None):
@@ -72,7 +87,7 @@ def status(client, keys, out=None):
     from alpaca.trading.enums import QueryOrderStatus
     clock = client.get_clock()
     acct = client.get_account()
-    lines = [f"===== 模拟盘状态 {dt.datetime.now():%Y-%m-%d %H:%M} =====",
+    lines = [f"===== {runmode.LABEL}状态 {dt.datetime.now():%Y-%m-%d %H:%M} =====",
              f"美股现在：{'开盘中' if clock.is_open else '休市'}　"
              f"下次开盘 {clock.next_open:%m-%d %H:%M}　下次收盘 {clock.next_close:%m-%d %H:%M}（美东时间）",
              f"账户净值：${float(acct.equity):,.2f}　现金：${float(acct.cash):,.2f}",
@@ -87,9 +102,9 @@ def status(client, keys, out=None):
     lines += ["", "未成交订单："]
     opens = client.get_orders(GetOrdersRequest(status=QueryOrderStatus.OPEN))
     lines += [f"  {fmt_order(o)}" for o in opens] or ["  无"]
-    lines += ["", "最近 10 笔已结束订单："]
+    lines += ["", "最近 10 笔已结束订单（时间：成交了的是成交时间，美东）："]
     closed = client.get_orders(GetOrdersRequest(status=QueryOrderStatus.CLOSED, limit=10))
-    lines += [f"  {o.submitted_at:%m-%d %H:%M} {fmt_order(o)}" for o in closed] or ["  无"]
+    lines += [f"  {when_text(o)} {fmt_order(o)}" for o in closed] or ["  无"]
     text = "\n".join(lines)
     print(text)
     os.makedirs(ORD_DIR, exist_ok=True)
@@ -225,7 +240,9 @@ def finish(lines):
 
 if __name__ == "__main__":
     mode = sys.argv[1] if len(sys.argv) > 1 else "status"
-    c, k = get_clients()
+    if mode == "place" and runmode.IS_LIVE:
+        sys.exit("实盘不支持用 order.json 手动下单（Claude 不替你下真钱订单）。要手动交易，请在 Alpaca 网页上自己操作。")
+    c, k = get_clients(trading=(mode == "place"))
     if mode == "place":
         place(c, k)
         print()

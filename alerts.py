@@ -1,13 +1,16 @@
 # -*- coding: utf-8 -*-
-"""报警：写入 alerts.txt，并在 Windows 右下角弹通知。手机推送由 Claude 定时任务读取 alerts.txt 转发。"""
+"""报警：写入 alerts.txt，并在 Windows 右下角弹通知。手机推送由 Claude 定时任务读取 alerts.txt 转发。
+实盘的警报写在 live\\alerts.txt，开头带“【实盘】”，通知标题是“Noire 实盘警报”。"""
 import os
 import base64
 import subprocess
 import datetime as dt
 
+import runmode
 from paths import rt
 
 ALERTS = rt("alerts.txt")
+TITLE = "Noire 实盘警报" if runmode.IS_LIVE else "Noire 交易警报"
 
 
 def notify(title: str, body: str):
@@ -30,7 +33,10 @@ def notify(title: str, body: str):
         print(f"通知发送失败：{e}")
 
 
-def add(msg: str, title: str = "Noire 交易警报", popup: bool = True):
+def add(msg: str, title: str = None, popup: bool = True):
+    title = title or TITLE
+    if runmode.IS_LIVE and not msg.startswith("【实盘】"):
+        msg = "【实盘】" + msg
     os.makedirs(os.path.dirname(ALERTS), exist_ok=True)
     with open(ALERTS, "a", encoding="utf-8") as f:
         f.write(f"{dt.datetime.now():%Y-%m-%d %H:%M}  {msg}\n")

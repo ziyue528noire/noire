@@ -3,6 +3,7 @@
 
   python tracking.py                    读本文件夹的记录，写 reports/tracking.txt
   python tracking.py --root 某文件夹     读另一个文件夹（例如云端日报把文件拷过去后在那边运行）
+  python tracking.py --root live --data data   实盘：记录在 live\\ 里，行情还在本文件夹的 data\\ 里
 
 用到的记录（都由系统自动写入）：
   equity_history.csv   每天收盘后的账户净值（paper_rotation 写）
@@ -51,10 +52,10 @@ def load_targets(root):
     return out
 
 
-def load_prices(root, symbols):
+def load_prices(root, symbols, data_dir=None):
     opens, closes = {}, {}
     for s in symbols:
-        p = os.path.join(root, "data", f"{s}.csv")
+        p = os.path.join(data_dir or os.path.join(root, "data"), f"{s}.csv")
         if not os.path.exists(p):
             continue
         df = pd.read_csv(p, index_col=0, parse_dates=True)
@@ -80,7 +81,7 @@ def latest_on_or_before(targets, day):
     return targets[max(keys)] if keys else None
 
 
-def daily_tracking(root):
+def daily_tracking(root, data_dir=None):
     hist = read_csv_rows(os.path.join(root, "equity_history.csv"))
     targets = load_targets(root)
     dips = load_dips(root)
@@ -88,7 +89,7 @@ def daily_tracking(root):
         return pd.DataFrame(), targets
     eq = pd.Series({dt.date.fromisoformat(r["date"]): float(r["equity"]) for r in hist}).sort_index()
     symbols = sorted({s for w in targets.values() for s in w} | {"SPY"})
-    opens, closes = load_prices(root, symbols)
+    opens, closes = load_prices(root, symbols, data_dir)
     if closes.empty:
         return pd.DataFrame(), targets
     cal = [d for d in closes.index]                     # 交易日历（以行情为准）
@@ -123,7 +124,7 @@ def daily_tracking(root):
     return pd.DataFrame(rows), targets
 
 
-def slippage(root):
+def slippage(root, data_dir=None):
     """本系统换仓单（noire-rot-）的成交价比当天开盘价吃亏多少（基点，正数 = 吃亏）。"""
     fills = [f for f in read_csv_rows(os.path.join(root, "logs", "fills.csv"))
              if str(f.get("client_order_id", "")).startswith("noire-rot-")]
@@ -134,7 +135,7 @@ def slippage(root):
     if not fills:
         return pd.DataFrame()
     syms = sorted({f["symbol"] for f in fills})
-    opens, _ = load_prices(root, syms)
+    opens, _ = load_prices(root, syms, data_dir)
     rows = []
     for f in fills:
         try:
@@ -150,9 +151,9 @@ def slippage(root):
     return pd.DataFrame(rows)
 
 
-def report(root):
-    tr, targets = daily_tracking(root)
-    sl = slippage(root)
+def report(root, data_dir=None):
+    tr, targets = daily_tracking(root, data_dir)
+    sl = slippage(root, data_dir)
     L = [f"实盘 vs 模型 对账（更新 {dt.datetime.now():%Y-%m-%d %H:%M}）"]
     if tr.empty:
         L.append("还没有足够的记录（需要连续几天的目标仓位和净值），以后会自动有。")
@@ -174,8 +175,10 @@ def report(root):
     if sl.empty:
         L.append("成交价：还没有成交记录。")
     else:
-        L += [f"成交价 vs 开盘价：{len(sl)} 笔，平均 {sl['bps'].mean():+.1f} 个基点（正数 = 比开盘价吃亏），"
-              f"合计约 ${sl['cost'].sum():,.0f}",
+        traded = float((sl["open"] * sl["qty"]).sum())
+        weighted = sl["cost"].sum() / traded * 1e4 if traded else float("nan")
+        L += [f"成交价 vs 开盘价：{len(sl)} 笔，按金额加权 {weighted:+.1f} 个基点（简单平均 {sl['bps'].mean():+.1f}；"
+              f"正数 = 比开盘价吃亏），合计约 ${sl['cost'].sum():,.0f}（成交 ${traded:,.0f}）",
               *[f"  {r.date} {r.side} {r.symbol} {r.qty:g} 股 @ {r.price:.2f}（开盘 {r.open:.2f}，{r.bps:+.1f} 基点）"
                 for r in sl.tail(8).itertuples()]]
     return "\n".join(L)
@@ -185,8 +188,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--root", default=HERE)
     ap.add_argument("--out", default=None)
+    ap.add_argument("--data", default=None, help="行情文件夹（默认 <root>/data）")
     a = ap.parse_args()
-    text = report(a.root)
+    text = report(a.root, a.data)
     out = a.out or os.path.join(a.root, "reports", "tracking.txt")
     os.makedirs(os.path.dirname(out), exist_ok=True)
     with open(out, "w", encoding="utf-8") as f:

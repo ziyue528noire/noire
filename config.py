@@ -69,6 +69,16 @@ MAINTENANCE_MARGIN = 0.30 # 估算用的维持保证金比例（券商实际数�
 SHARED_SCOREBOARD_DIR = r"D:\scoreboard"   # 两边各写各的 CSV，互不修改
 SCOREBOARD_NAME = "claude"                 # 本系统写 D:\scoreboard\claude.csv
 
+# ===== 实盘（真钱）：只在实盘脚本里用（NOIRE_PROFILE=live）；默认关闭 =====
+# 真钱下单必须同时满足三条：LIVE_ENABLED = True、用户自己双击 enable_live.bat、LIVE_MAX_CAPITAL > 0。
+# 实盘的记录全部在 live\ 子文件夹；模拟盘照常运行，互不影响。
+LIVE_ENABLED = False       # 总开关
+LIVE_MAX_CAPITAL = 0       # 实盘最多管理多少美元（0 = 不交易）；账户里超出的钱不动
+LIVE_MAX_LEVERAGE = 1.0    # 实盘杠杆上限：1.0 = 不借钱；1.5；2.0 = 和模拟盘一样（不能超过上面的 LEVERAGE）
+LIVE_FRACTIONAL = True     # 实盘按金额下单（可以买零股，小金额也能按比例配仓）
+LIVE_MAX_ORDER = 1.1       # 单笔订单金额上限 = 管理资金 × 杠杆上限 × 1.1（防程序出错下超大单）
+LIVE_MIN_ORDER = 5.0       # 小于 5 美元的零碎订单不下
+
 # ===== 文件位置 =====
 DATA_DIR = "data"
 REPORT_DIR = "reports"

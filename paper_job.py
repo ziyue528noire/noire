@@ -86,8 +86,23 @@ def run_rotation() -> str:
         sys.argv = old
 
 
+def live_gate():
+    """实盘（NOIRE_PROFILE=live）：三道闸没全过 → 返回原因（这时不跑自检、不连券商、不下单）。模拟盘返回 None。"""
+    import runmode
+    if not runmode.IS_LIVE:
+        return None
+    import broker
+    ok, why = broker.live_trading_ready()
+    return None if ok else why
+
+
 def main(now: dt.datetime = None) -> int:
     now = now or dt.datetime.now()
+    why_off = live_gate()
+    if why_off:
+        print(f"{now:%Y-%m-%d %H:%M} 实盘自动交易没有打开（{why_off}），本次不运行。"
+              "只想看看会怎么买卖，可以双击 live_dryrun.bat")
+        return 0
     today = f"{now:%Y-%m-%d}"
     st = load_state(today)
     if st["success"]:

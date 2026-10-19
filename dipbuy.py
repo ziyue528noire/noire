@@ -38,11 +38,13 @@ def positions(close: pd.Series) -> pd.Series:
     return pd.Series(out, index=close.index)
 
 
-def allocate(target: pd.Series):
-    """把第二条腿加到 A+ 的目标上（目标是“占本金的比例”，已含杠杆）。返回 (新目标, 第二条腿占本金的比例)。"""
+def allocate(target: pd.Series, max_total=None):
+    """把第二条腿加到 A+ 的目标上（目标是“占本金的比例”，已含杠杆）。返回 (新目标, 第二条腿占本金的比例)。
+    max_total：总仓位上限（实盘的杠杆上限）；None = LEVERAGE（模拟盘，和以前一样）。"""
     cash, sym = config.CASH_SYMBOL, config.DIP_SYMBOL
+    cap = config.LEVERAGE if max_total is None else float(max_total)
     risky = float(sum(w for s, w in target.items() if s != cash))
-    spare = max(0.0, min(config.DIP_MAX, config.LEVERAGE - risky))
+    spare = max(0.0, min(config.DIP_MAX, cap - risky))
     new = target.copy()
     new[sym] = float(new.get(sym, 0.0)) + spare
     if cash in new.index:
@@ -50,8 +52,9 @@ def allocate(target: pd.Series):
     return new[new > 1e-9], spare
 
 
-def compute(closes: pd.DataFrame, target: pd.Series):
-    """返回 (合并后的目标, 第二条腿占本金的比例, 说明行)。没启用或没触发时目标不变。"""
+def compute(closes: pd.DataFrame, target: pd.Series, max_total=None):
+    """返回 (合并后的目标, 第二条腿占本金的比例, 说明行)。没启用或没触发时目标不变。
+    max_total：总仓位上限（实盘的杠杆上限）；None = 模拟盘。"""
     sym = config.DIP_SYMBOL
     if not getattr(config, "DIP_ENABLED", False):
         return target, 0.0, ["第二条腿（RSI(2) 超跌反弹）：未启用"]
@@ -70,7 +73,7 @@ def compute(closes: pd.DataFrame, target: pd.Series):
         return target, 0.0, [f"第二条腿（RSI(2) 超跌反弹）：{note}（{detail}）"]
     since = pos.index[(pos.diff().fillna(pos) > 0).values][-1]          # 这一次是哪天收盘触发的
     when = "今天收盘新触发" if since == pos.index[-1] else f"{pd.Timestamp(since).date()} 收盘触发"
-    new, spare = allocate(target)
+    new, spare = allocate(target, max_total)
     note = (f"持有中（{when}），用 A+ 没用完的额度 {spare:.0%} 买 {sym}" if spare > 0
             else f"持有中（{when}），但 A+ 已用满额度，这次不加仓")
     return new, spare, [f"第二条腿（RSI(2) 超跌反弹）：{note}（{detail}）"]

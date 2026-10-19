@@ -4,6 +4,7 @@ rem paper_job.py skips if today's run already succeeded; only the 3rd failure ra
 chcp 65001 >nul
 cd /d "%~dp0"
 set PYTHONUTF8=1
+set "NOIRE_PROFILE="
 if not exist logs mkdir logs
 call _python.bat versions.py save auto-snapshot-before-daily-run >> logs\paper_log.txt 2>&1
 call _git.bat --version >nul 2>&1

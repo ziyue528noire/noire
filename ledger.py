@@ -67,6 +67,15 @@ def ledger_start():
     return None
 
 
+def size_text(o) -> str:
+    """订单大小的文字：按股数下的单显示股数，按金额下的单（实盘零股）显示金额。"""
+    qty = getattr(o, "qty", None)
+    if qty not in (None, "", "None"):
+        return f"{float(qty):g} 股"
+    notional = getattr(o, "notional", None)
+    return f"${float(notional):,.2f}" if notional not in (None, "", "None") else "? 股"
+
+
 def make_id(kind: str, symbol: str, side: str, day: dt.date = None, extra: str = "") -> str:
     """kind: rot=策略换仓, man=手动下单。最长 128 字符（券商限制）。"""
     day = day or dt.date.today()
