@@ -402,10 +402,16 @@ class SafetyTests(unittest.TestCase):
         return scoreboard.read(scoreboard.HISTORY)[-1]
 
     def test_scoreboard_records_closing_equity(self):
+        with open(paper_rotation.STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump({"start_date": "2026-01-02", "start_equity": 100000, "spy_start": last_price("SPY")}, f)
         row = self._run_with_data_notes([])
         want = -15000 + 100 * last_price("QQQ") + 1000 * last_price("EEM")
         self.assertEqual(row["equity"], f"{want:.2f}")                   # 收盘净值：现金 + 持仓 × 收盘价
         self.assertEqual(row["broker_equity"], "100000.00")              # 17:00 的券商净值另记一列
+        with open(paper_rotation.STATUS_FILE, encoding="utf-8") as f:
+            status = f.read()
+        self.assertIn(f"账户净值：${want:,.2f}（收盘净值；17:00 券商读数 $100,000.00", status)
+        self.assertIn(f"策略 {want / 100000 - 1:+.2%}", status)           # “自起点”和成绩单用同一个净值
 
     def test_scoreboard_uses_broker_equity_when_data_not_current(self):
         row = self._run_with_data_notes(["⚠ 行情不是最新的：最新只有昨天"])

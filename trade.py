@@ -91,7 +91,8 @@ def status(client, keys, out=None):
              f"美股现在：{'开盘中' if clock.is_open else '休市'}　"
              f"下次开盘 {clock.next_open:%m-%d %H:%M}　下次收盘 {clock.next_close:%m-%d %H:%M}（美东时间）",
              f"账户净值：${float(acct.equity):,.2f}　现金：${float(acct.cash):,.2f}",
-             f"今日盈亏：{day_pnl_text(acct)}", "", "持仓："]
+             f"今日盈亏：{day_pnl_text(acct)}{'' if clock.is_open else '（券商口径：收盘后会随盘后价格变动；成绩单用收盘净值）'}",
+             "", "持仓："]
     pos = client.get_all_positions()
     for p in pos:
         lines.append(f"  {p.symbol:<6} {float(p.qty):>8g} 股　成本 ${float(p.avg_entry_price):,.2f}　"

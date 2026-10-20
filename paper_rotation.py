@@ -201,10 +201,10 @@ def main():
                  f"距追缴保证金 {'—（没借钱）' if gross_now <= equity else f'再跌 {dist:.0%}'}")
     print(f"风控：{risk_line}")
 
+    # 收盘净值（现金 + 持仓 × 收盘价）：成绩单和状态里的“自起点”都用它；行情不是最新/不完整时退回用券商 17:00 的净值
+    eq_close = equity if data_notes else close_equity(cash, all_pos, closes.iloc[-1])
     if live and trading_today is not False:   # 成绩单：每个交易日记一行（休市日不记；第一次会先补上起点那一天）
         gross = sum(v for q, v in all_pos.values())
-        # 记收盘净值；行情不是最新/不完整时收盘价不可靠 → 退回用券商 17:00 的净值
-        eq_close = equity if data_notes else close_equity(cash, all_pos, closes.iloc[-1])
         record_score(now.date(), eq_close, float(closes["SPY"].iloc[-1]),
                      gross / equity if equity else 0, risk.update_peak(equity)["drawdown"], broker_equity=equity)
 
@@ -214,7 +214,8 @@ def main():
         print(f"有 {len(open_orders)} 笔订单还没成交，本次不再下单（等它们成交后再检查）")
         for o in open_orders:
             print(f"  待成交：{o.side.value} {ledger.size_text(o)} {o.symbol}")
-        write_status(equity, positions, target, sig_lines, ["有未成交订单，跳过"], closes, live, risk_line=risk_line)
+        write_status(equity, positions, target, sig_lines, ["有未成交订单，跳过"], closes, live, risk_line=risk_line,
+                     close_eq=eq_close)
         return "ok"
 
     # ---- 3. 算出要买卖什么 ----
@@ -350,7 +351,7 @@ def main():
     elif orders:
         print("（空跑，没有下单。加 --live 才会提交）")
 
-    write_status(equity, positions, target, sig_lines, actions, closes, live, risk_line=risk_line)
+    write_status(equity, positions, target, sig_lines, actions, closes, live, risk_line=risk_line, close_eq=eq_close)
     return "blocked" if stopped else "ok"
 
 
@@ -392,30 +393,33 @@ def log_trade(when, sym, side, qty, ref_price, why):
         f.write(f"{when:%Y-%m-%d %H:%M},{sym},{side},{qty:g},{ref_price:.2f},{why}\n")
 
 
-def write_status(equity, positions, target, sig_lines, actions, closes, live=False, risk_line=""):
+def write_status(equity, positions, target, sig_lines, actions, closes, live=False, risk_line="", close_eq=None):
     """生成一页状态报告，并和“同期一直持有 SPY”比较。
-    正式运行写 paper_status.txt；空跑写 paper_status_dryrun.txt（以前空跑会覆盖正式状态，日报/周报会读错）。"""
+    正式运行写 paper_status.txt；空跑写 paper_status_dryrun.txt（以前空跑会覆盖正式状态，日报/周报会读错）。
+    close_eq：收盘净值。有它时“账户净值”和“自起点”都用它（和成绩单一致），券商 17:00 的读数另外注明（2026-10-20）。"""
     spy_now = float(closes["SPY"].iloc[-1])
+    shown = equity if close_eq is None else float(close_eq)
     state = {}
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE, encoding="utf-8") as f:
             state = json.load(f)
     elif live:   # 第一次真正运行时记下起点
-        state = {"start_date": str(closes.index[-1].date()), "start_equity": equity, "spy_start": spy_now}
+        state = {"start_date": str(closes.index[-1].date()), "start_equity": shown, "spy_start": spy_now}
         with open(STATE_FILE, "w", encoding="utf-8") as f:
             json.dump(state, f, ensure_ascii=False, indent=2)
 
     lines = [f"更新时间：{dt.datetime.now():%Y-%m-%d %H:%M}　策略：{config.STRATEGY_NAME}"
              + ("　【实盘】" if runmode.IS_LIVE else "")
              + ("" if live else "　【空跑，没有下单】"),
-             f"账户净值：${equity:,.2f}",
+             (f"账户净值：${shown:,.2f}（收盘净值；17:00 券商读数 ${equity:,.2f}，含盘后价格）"
+              if abs(shown - equity) >= 0.01 else f"账户净值：${equity:,.2f}"),
              f"目标（占本金，已含杠杆）：{', '.join(f'{s} {w:.0%}' for s, w in target.items())}",
              *sig_lines,
              f"当前持仓：{', '.join(f'{s} {q:g}股' for s, (q, v) in positions.items()) or '无'}",
              *([f"风险：{risk_line}"] if risk_line else []),
              "本次操作：", *[f"  {a}" for a in actions]]
     if state:
-        mine = equity / state["start_equity"] - 1
+        mine = shown / state["start_equity"] - 1
         spy = spy_now / state["spy_start"] - 1
         lines += ["", f"自 {state['start_date']} 起：策略 {mine:+.2%}　同期 SPY {spy:+.2%}　"
                       f"{'领先' if mine >= spy else '落后'} {abs(mine - spy):.2%}"]
