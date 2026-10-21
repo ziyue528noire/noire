@@ -923,6 +923,30 @@ class DataAndMonitorTests(unittest.TestCase):
         self.assertIn("本地缓存没有改动", str(cm.exception))
         self.assertIsNone(data._problem(self.frame("2010-01-04", 301), old))   # 多一天新数据是正常的
 
+    def test_empty_price_rows_are_dropped(self):
+        # Yahoo 偶尔把最新一天给成空值（只有成交量）：这一行不要，其余照常
+        good = self.frame("2010-01-04", 300)
+        bad = good.copy()
+        bad.loc[bad.index[-1], ["Open", "High", "Low", "Close"]] = float("nan")
+        self.fake_yf([bad])
+        df = data._download("SPY", good.iloc[:-1])
+        self.assertEqual(len(df), 299)
+        self.assertFalse(df.isna().any().any())
+        self.assertEqual(self.waits, [])
+
+    def test_newer_cache_is_kept_when_download_lags(self):
+        # 17:00 已经下载到今天的完整数据；晚上再下载时今天那行是空值 → 不重试、不覆盖，继续用本地缓存
+        good = self.frame("2010-01-04", 300)
+        bad = good.copy()
+        bad.loc[bad.index[-1], ["Open", "High", "Low", "Close"]] = float("nan")
+        calls = self.fake_yf([bad])
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            df = data._download("SPY", good)
+        self.assertTrue(df.equals(good))
+        self.assertEqual(len(calls), 1)                    # 只下载了一次，没有白等
+        self.assertEqual(self.waits, [])
+        self.assertIn("继续用本地缓存", out.getvalue())
+
     def test_cache_write_is_atomic_and_leaves_no_temp_file(self):
         # 模拟盘和实盘共用 data\ 缓存：先写临时文件再整体替换，别的程序读到的永远是完整文件
         d = tempfile.mkdtemp(dir=TMP)

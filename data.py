@@ -7,6 +7,9 @@
     不覆盖本地缓存（否则动量会因为“历史不够”而全部换成现金）
 实盘准备（2026-10-18）：模拟盘和实盘共用 data\\ 缓存 → 写缓存时先写临时文件再整体替换，
     两边前后脚运行时也不会读到写了一半的文件。
+2026-10-20：晚上 8 点以后 Yahoo 有时把当天那一行给成空值（只有成交量，没有价格）。以前这种行会照样写进缓存，
+    还会把 17:00 下载好的完整数据盖掉（10-20 晚上空跑时发生过）。现在：价格为空的行直接丢掉；
+    丢掉以后如果只是“最新几天比本地缓存少”、其余都正常 → 不重试、不覆盖，继续用本地缓存。
 """
 import os
 import time
@@ -15,6 +18,7 @@ import config
 
 DOWNLOAD_TRIES = 3
 DOWNLOAD_WAITS = (20, 60)       # 第 2、3 次之前各等多少秒
+PRICE_COLS = ["Open", "High", "Low", "Close"]
 
 
 def _problem(new: pd.DataFrame, old: pd.DataFrame):
@@ -41,10 +45,16 @@ def _download(symbol: str, old: pd.DataFrame = None) -> pd.DataFrame:
             if df is not None and not df.empty:
                 if isinstance(df.columns, pd.MultiIndex):   # 新版 yfinance 返回多级列
                     df.columns = df.columns.get_level_values(0)
-                df = df[["Open", "High", "Low", "Close", "Volume"]]
+                df = df[["Open", "High", "Low", "Close", "Volume"]].dropna(subset=PRICE_COLS)   # 价格为空的行不要
             why = _problem(df, old)
             if why is None:
                 return df
+            if (old is not None and not old.empty and df is not None and not df.empty
+                    and df.index[-1] < old.index[-1] and _problem(df, old.loc[:df.index[-1]]) is None):
+                # 只是最新几天比本地缓存少（其余都正常）：多半是 Yahoo 暂时把最新一天给成了空值，等也没用
+                print(f"  {symbol} 新下载的数据只到 {df.index[-1].date()}，比本地缓存（到 {old.index[-1].date()}）旧，"
+                      f"继续用本地缓存")
+                return old
         except Exception as e:
             why = str(e)[:120]
         if i < DOWNLOAD_TRIES - 1:
