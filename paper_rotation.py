@@ -396,7 +396,7 @@ def log_trade(when, sym, side, qty, ref_price, why):
 def write_status(equity, positions, target, sig_lines, actions, closes, live=False, risk_line="", close_eq=None):
     """生成一页状态报告，并和“同期一直持有 SPY”比较。
     正式运行写 paper_status.txt；空跑写 paper_status_dryrun.txt（以前空跑会覆盖正式状态，日报/周报会读错）。
-    close_eq：收盘净值。有它时“账户净值”和“自起点”都用它（和成绩单一致），券商 17:00 的读数另外注明（2026-10-20）。"""
+    close_eq：收盘净值。有它时“账户净值”和“自起点”都用它（和成绩单一致），券商当时的读数另外注明（2026-10-20）。"""
     spy_now = float(closes["SPY"].iloc[-1])
     shown = equity if close_eq is None else float(close_eq)
     state = {}
@@ -411,7 +411,7 @@ def write_status(equity, positions, target, sig_lines, actions, closes, live=Fal
     lines = [f"更新时间：{dt.datetime.now():%Y-%m-%d %H:%M}　策略：{config.STRATEGY_NAME}"
              + ("　【实盘】" if runmode.IS_LIVE else "")
              + ("" if live else "　【空跑，没有下单】"),
-             (f"账户净值：${shown:,.2f}（收盘净值；17:00 券商读数 ${equity:,.2f}，含盘后价格）"
+             (f"账户净值：${shown:,.2f}（收盘净值；券商当时的读数是 ${equity:,.2f}，含盘后价格）"
               if abs(shown - equity) >= 0.01 else f"账户净值：${equity:,.2f}"),
              f"目标（占本金，已含杠杆）：{', '.join(f'{s} {w:.0%}' for s, w in target.items())}",
              *sig_lines,

@@ -410,7 +410,7 @@ class SafetyTests(unittest.TestCase):
         self.assertEqual(row["broker_equity"], "100000.00")              # 17:00 的券商净值另记一列
         with open(paper_rotation.STATUS_FILE, encoding="utf-8") as f:
             status = f.read()
-        self.assertIn(f"账户净值：${want:,.2f}（收盘净值；17:00 券商读数 $100,000.00", status)
+        self.assertIn(f"账户净值：${want:,.2f}（收盘净值；券商当时的读数是 $100,000.00", status)
         self.assertIn(f"策略 {want / 100000 - 1:+.2%}", status)           # “自起点”和成绩单用同一个净值
 
     def test_scoreboard_uses_broker_equity_when_data_not_current(self):
