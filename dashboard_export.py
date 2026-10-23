@@ -183,7 +183,7 @@ def export(proj, out, backtest=False):
         add("保证金", "ok" if mb >= 25 else ("warn" if mb >= 15 else "bad"), f"再跌 {mb:.0f}% 才会被追缴", today)
     dd = last["drawdown_pct"]
     add("回撤", "ok" if dd < 20 else ("warn" if dd < 39 else "bad"),
-        f"离最高点 -{dd:.1f}%（历史上 15%~20% 算正常，超过 39% 要停下检查）", today)
+        f"离最高点 -{dd:.1f}%（历史最坏约 39%，超过才要停下检查）", today)
 
     files = {"equity": equity, "status": status, "holdings": holdings, "tranches": tranches, "scoreboard": score,
              "trades": trades, "health": health}
