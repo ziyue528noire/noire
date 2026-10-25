@@ -20,3 +20,4 @@ paper_state.json
 
 # research data (downloaded, large)
 research/data/
+.env.*
