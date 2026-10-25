@@ -142,6 +142,16 @@ elif scenario == "keys":
     with open(os.path.join(env_dir, ".env.live"), "w", encoding="utf-8") as f:
         f.write("ALPACA_LIVE_KEY=LIVEKEY\nALPACA_LIVE_SECRET=LIVESECRET\n")
     out["with_live_file"] = list(keys.load_keys())
+elif scenario == "alert":
+    if ARGS.get("mirror"):
+        os.environ["EXC_ALERTS_MIRROR"] = ARGS["mirror"]
+    import alerts
+    out["mirror_path"] = alerts._mirror_path()
+    out["result"], out["error"], out["stdout"] = run(lambda: alerts.add("测试警报", popup=False), [])
+    with open(alerts.ALERTS, encoding="utf-8") as f:
+        out["live_alerts"] = f.read()
+    m = ARGS.get("mirror")
+    out["mirror_text"] = open(m, encoding="utf-8").read() if m and os.path.exists(m) else None
 else:
     raise SystemExit(f"unknown scenario {scenario}")
 

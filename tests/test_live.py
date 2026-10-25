@@ -181,6 +181,26 @@ class LiveModeTests(unittest.TestCase):
                              capture_output=True, text=True, timeout=60).stdout.strip()
         self.assertEqual(out, os.path.join(PROJECT, "live"))
 
+    # ---------- 实盘警报抄送到本文件夹的 alerts.txt（手机推送的定时任务只读这个文件）----------
+    def test_live_alerts_are_copied_for_phone_push(self):
+        mirror = os.path.join(tempfile.mkdtemp(prefix="noire_mirror_"), "alerts.txt")
+        try:
+            r = scenario("alert", mirror=mirror)
+            self.assertIn("【实盘】测试警报", r["live_alerts"])
+            self.assertIsNotNone(r["mirror_text"])
+            self.assertIn("【实盘】测试警报", r["mirror_text"])
+        finally:
+            shutil.rmtree(os.path.dirname(mirror), ignore_errors=True)
+
+    def test_alert_copy_never_touches_real_files_in_tests(self):
+        r = scenario("alert")                          # 没给临时抄送位置 → 不抄送
+        self.assertIsNone(r["mirror_path"])
+        self.assertIn("【实盘】测试警报", r["live_alerts"])
+
+    def test_paper_alerts_are_not_copied(self):
+        import alerts
+        self.assertIsNone(alerts._mirror_path())
+
     def test_daily_self_test_always_runs_in_paper_mode(self):
         import preflight
         seen = {}
