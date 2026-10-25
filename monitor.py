@@ -174,7 +174,7 @@ def main():
     gross = float(acct.long_market_value or 0) + abs(float(acct.short_market_value or 0))
     maint = float(getattr(acct, "maintenance_margin", 0) or 0)
     lev_now = gross / equity if equity > 0 else 0
-    dd = risk.update_peak(equity)["drawdown"]
+    dd = risk.drawdown_now(equity)["drawdown"]   # 相对最高收盘净值；盘中读数不改最高点
     day = risk.daily_loss(equity, last_equity)
     dist = risk.margin_distance(equity, gross, maint / gross if gross and maint else None)
 

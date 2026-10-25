@@ -206,7 +206,8 @@ def main():
     if live and trading_today is not False:   # 成绩单：每个交易日记一行（休市日不记；第一次会先补上起点那一天）
         gross = sum(v for q, v in all_pos.values())
         record_score(now.date(), eq_close, float(closes["SPY"].iloc[-1]),
-                     gross / equity if equity else 0, risk.update_peak(equity)["drawdown"], broker_equity=equity)
+                     gross / equity if equity else 0, risk.update_peak(eq_close, now.date())["drawdown"],
+                     broker_equity=equity)   # 回撤用收盘净值（和成绩单、仪表盘一致）
 
     open_orders = [o for o in client.get_orders(GetOrdersRequest(status=QueryOrderStatus.OPEN))
                    if o.symbol in managed]

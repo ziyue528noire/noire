@@ -8,6 +8,7 @@
 反而比不加杠杆差）；杠杆改由 aplus.py 的波动目标 + 趋势开关提前控制。回撤仍会记录并报警。
 状态保存在 risk_state.json（记录账户历史最高净值、每天的起始净值）。
 """
+import csv
 import json
 import datetime as dt
 import os
@@ -38,15 +39,47 @@ def save_state(state: dict):
         json.dump(state, f, ensure_ascii=False, indent=2)
 
 
-def update_peak(equity: float) -> dict:
-    """更新历史最高净值，返回 {peak, drawdown}。"""
+HISTORY_FILE = rt("equity_history.csv")
+
+
+def close_peak(exclude_date: str = None) -> float:
+    """历史最高收盘净值 = equity_history.csv 的 equity 列最大值（2026-10-24 起统一用它算回撤）。
+    10-19 及以前的老行没有收盘净值，equity 列就是当时的券商读数，照旧使用。
+    exclude_date：同一天重跑时不算当天旧的那一行。没有记录时返回 0。"""
+    peak = 0.0
+    try:
+        with open(HISTORY_FILE, encoding="utf-8-sig") as f:
+            for r in csv.DictReader(f):
+                if r.get("date") and r.get("equity") and r["date"] != exclude_date:
+                    peak = max(peak, float(r["equity"]))
+    except (OSError, ValueError):
+        pass
+    return peak
+
+
+def _drawdown(equity: float, peak: float) -> float:
+    return max(1 - equity / peak, 0.0) if peak > 0 else 0.0
+
+
+def update_peak(equity: float, day: dt.date = None) -> dict:
+    """收盘后（17:00 换仓）调用，equity 传当天的收盘净值。最高点 = 以前的最高收盘净值和今天取大，
+    记进 risk_state.json（仪表盘读它）；返回 {peak, drawdown}。
+    还没有净值记录时（新账户）退回用 risk_state.json 里存的最高点。"""
     st = load_state()
-    peak = max(float(st.get("peak_equity", 0)), equity)
+    hist_peak = close_peak(f"{day:%Y-%m-%d}" if day else None)
+    base = hist_peak if hist_peak > 0 else float(st.get("peak_equity", 0))
+    peak = max(base, equity)
     st["peak_equity"] = peak
     st["last_equity_seen"] = equity
     st["updated"] = f"{dt.datetime.now():%Y-%m-%d %H:%M}"
     save_state(st)
-    return {"peak": peak, "drawdown": 1 - equity / peak if peak > 0 else 0.0}
+    return {"peak": peak, "drawdown": _drawdown(equity, peak)}
+
+
+def drawdown_now(equity: float) -> dict:
+    """盘中监控用：当前读数相对“最高收盘净值”的回撤。只看不改——盘中读数不再抬高最高点。"""
+    peak = close_peak() or float(load_state().get("peak_equity", 0))
+    return {"peak": peak, "drawdown": _drawdown(equity, peak)}
 
 
 def day_base(equity: float, last_equity: float) -> float:

@@ -417,6 +417,40 @@ class SafetyTests(unittest.TestCase):
         row = self._run_with_data_notes(["⚠ 行情不是最新的：最新只有昨天"])
         self.assertEqual(row["equity"], "100000.00")                     # 收盘价不可靠 → 用券商净值
 
+    # ---------- 回撤统一用收盘净值（2026-10-24） ----------
+    def _write_history(self, rows):
+        with open(risk.HISTORY_FILE, "w", encoding="utf-8") as f:
+            f.write("date,equity,spy_close,leverage,drawdown,broker_equity\n")
+            for d, eq, be in rows:
+                f.write(f"{d},{eq},500,1.0,0.0,{be}\n")
+
+    def test_drawdown_uses_closing_equity_peak(self):
+        # 老行（没有 broker_equity）的 equity 是当时读数，照旧算；新行只看 equity 列（收盘净值），不看 broker_equity
+        self._write_history([("2026-10-16", "110000.00", ""), ("2026-10-20", "120000.00", "125000.00"),
+                             ("2026-10-21", "100000.00", "99000.00")])
+        risk.save_state({"peak_equity": 130000})                          # 以前用券商读数存下的偏高峰值：不再使用
+        self.assertEqual(risk.close_peak(), 120000)
+        self.assertEqual(risk.close_peak("2026-10-20"), 110000)           # 同一天重跑不算当天旧行
+        info = risk.update_peak(108000, dt.date(2026, 10, 22))
+        self.assertEqual(info["peak"], 120000)
+        self.assertAlmostEqual(info["drawdown"], 0.10)
+        self.assertEqual(risk.load_state()["peak_equity"], 120000)        # 仪表盘读到的峰值也改成收盘净值
+        # 盘中监控：读数高于最高收盘净值也不抬高最高点，回撤记 0
+        self.assertEqual(risk.drawdown_now(126000), {"peak": 120000, "drawdown": 0.0})
+        self.assertAlmostEqual(risk.drawdown_now(102000)["drawdown"], 0.15)
+        self.assertEqual(risk.load_state()["peak_equity"], 120000)
+        # 新账户还没有记录：退回用存下的峰值
+        os.remove(risk.HISTORY_FILE)
+        self.assertAlmostEqual(risk.drawdown_now(117000)["drawdown"], 0.025)
+
+    def test_rotation_records_drawdown_from_closing_equity(self):
+        self._write_history([("2026-01-02", "120000.00", "")])
+        risk.save_state({"peak_equity": 200000})
+        row = self._run_with_data_notes([])
+        want = -15000 + 100 * last_price("QQQ") + 1000 * last_price("EEM")
+        self.assertEqual(row["drawdown"], f"{1 - want / 120000:.4f}")    # 收盘净值 vs 最高收盘净值，不是 17:00 券商读数
+        self.assertNotEqual(row["drawdown"], f"{1 - 100000 / 120000:.4f}")
+
     def test_close_equity_falls_back_to_broker_value_for_unknown_symbols(self):
         last = pd.Series({"QQQ": 100.0})
         self.assertAlmostEqual(paper_rotation.close_equity(-500, {"QQQ": (10, 1200), "NVDA": (2, 300)}, last),
