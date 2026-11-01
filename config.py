@@ -72,8 +72,10 @@ SCOREBOARD_NAME = "claude"                 # 本系统写 D:\scoreboard\claude.c
 # ===== 实盘（真钱）：只在实盘脚本里用（NOIRE_PROFILE=live）；默认关闭 =====
 # 真钱下单必须同时满足三条：LIVE_ENABLED = True、用户自己双击 enable_live.bat、LIVE_MAX_CAPITAL > 0。
 # 实盘的记录全部在 live\ 子文件夹；模拟盘照常运行，互不影响。
-LIVE_ENABLED = False       # 总开关
-LIVE_MAX_CAPITAL = 0       # 实盘最多管理多少美元（0 = 不交易）；账户里超出的钱不动
+LIVE_ENABLED = True        # 总开关（2026-10-31 用户同意打开）
+LIVE_MAX_CAPITAL = 10000   # 实盘最多管理多少美元（0 = 不交易）；账户里超出的钱不动
+                           # 2026-10-31 用户：账户里所有的钱都由 Noire 管（现在 $700）→ 上限设得远高于余额，
+                           # 赚的钱和以后存的钱也会投进去；这个上限只防意外的大额入金（超过时多出的钱留现金不动）
 LIVE_MAX_LEVERAGE = 1.0    # 实盘杠杆上限：1.0 = 不借钱；1.5；2.0 = 和模拟盘一样（不能超过上面的 LEVERAGE）
 LIVE_FRACTIONAL = True     # 实盘按金额下单（可以买零股，小金额也能按比例配仓）
 LIVE_MAX_ORDER = 1.1       # 单笔订单金额上限 = 管理资金 × 杠杆上限 × 1.1（防程序出错下超大单）

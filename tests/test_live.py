@@ -49,8 +49,10 @@ EMPTY_10K = {"equity": 10000, "cash": 10000, "regt": 20000}
 class LiveModeTests(unittest.TestCase):
     # ---------- 三道闸 ----------
     def test_live_is_off_by_default(self):
-        r = scenario("rotation", submit=True, flag=True, config={"LIVE_MAX_CAPITAL": 3000},
-                     account=EMPTY_10K)                                     # LIVE_ENABLED 保持默认 False
+        # 总开关 LIVE_ENABLED = False 时绝不下单。这里明确写出 False，不依赖 config.py 当前的值：
+        # 用户打开实盘后 config.py 里是 True，如果靠默认值，这个测试会失败、挡住每天的自检（2026-10-31）
+        r = scenario("rotation", submit=True, flag=True, config={"LIVE_ENABLED": False, "LIVE_MAX_CAPITAL": 3000},
+                     account=EMPTY_10K)
         self.assertEqual(r["result"], "disabled")
         self.assertEqual(r["orders"], [])
         self.assertEqual(r["paper_flags"], [])          # 连实盘账户都没连
