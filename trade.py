@@ -91,7 +91,7 @@ def status(client, keys, out=None):
              f"美股现在：{'开盘中' if clock.is_open else '休市'}　"
              f"下次开盘 {clock.next_open:%m-%d %H:%M}　下次收盘 {clock.next_close:%m-%d %H:%M}（美东时间）",
              f"账户净值：${float(acct.equity):,.2f}　现金：${float(acct.cash):,.2f}",
-             f"今日盈亏：{day_pnl_text(acct)}{'' if clock.is_open else '（券商口径：收盘后会随盘后价格变动；成绩单用收盘净值）'}",
+             f"今日盈亏：{day_pnl_text(acct, today_flow(client))}{'' if clock.is_open else '（券商口径：收盘后会随盘后价格变动；成绩单用收盘净值）'}",
              "", "持仓："]
     pos = client.get_all_positions()
     for p in pos:
@@ -214,12 +214,28 @@ def place(client, keys):
     finish(out)
 
 
-def day_pnl_text(acct) -> str:
+def day_pnl_text(acct, day_flow: float = 0.0) -> str:
+    """今日盈亏（券商口径）。day_flow = 今天存取的钱（实盘），扣除后才是真正赚亏的（2026-11-05）。"""
     import risk
     eq, last = float(acct.equity), float(acct.last_equity or 0)
     base = risk.day_base(eq, last)
     note = "" if last > 0 else "（券商没有昨日净值，按今天首次记录的净值算）"
-    return f"${eq - base:+,.2f}（{eq / base - 1:+.2%}）{note}" if base else "无数据"
+    if day_flow:
+        import cashflow
+        note += f"（已扣除今天的出入金 {cashflow.describe(day_flow)}）"
+    return f"${eq - day_flow - base:+,.2f}（{(eq - day_flow) / base - 1:+.2%}）{note}" if base else "无数据"
+
+
+def today_flow(client) -> float:
+    """实盘今天存取的钱（只读查券商记录）；模拟盘或查不到时返回 0。"""
+    if not runmode.IS_LIVE:
+        return 0.0
+    try:
+        import cashflow
+        fl = cashflow.Flows(client)
+        return fl.since(cashflow.prev_close(client)) if fl.ok else 0.0
+    except Exception:
+        return 0.0
 
 
 def log_trade(sym, side, qty, price, why):

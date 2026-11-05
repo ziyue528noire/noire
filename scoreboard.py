@@ -8,6 +8,8 @@ r"""成绩单：每个交易日记一行净值，和同期 SPY 比较。
   date = 美东交易日 YYYY-MM-DD，equity = 当天收盘后的账户净值（美元）
   其他列（如 spy_close、leverage）可有可无。
 本系统从 2026-10 起 equity 记“收盘净值”（现金 + 持仓 × 官方收盘价），broker_equity 列是 17:00 读到的券商净值（含盘后价格）。
+flow 列（2026-11-05 起，实盘）= 当天存取的钱（存为正、取为负）；有出入金时收益、回撤、波动都按扣除出入金的
+“时间加权”算法（见 cashflow.py），存钱不算赚、取钱不算亏。没有 flow 列或全为空的记录（模拟盘、其他系统）算法和以前完全一样。
 起止日期不同的系统，另有一行“同场比较”只看大家都有记录的共同区间。
 本系统自己的记录在 equity_history.csv，由每天 17:00 的自动换仓写入，
 并同步一份到共享文件夹 D:\scoreboard\claude.csv（只写这一个文件）。
@@ -19,6 +21,7 @@ import glob
 import math
 import datetime as dt
 
+import cashflow
 import config
 import runmode
 from paths import rt, HERE
@@ -32,17 +35,19 @@ MY_SHARED = os.path.join(SHARED_DIR, f"{config.SCOREBOARD_NAME}.csv")
 PAPER_HISTORY = rt("paper_equity_history.csv") if os.environ.get("EXC_RUNTIME_DIR") \
     else os.path.join(HERE, "equity_history.csv")
 REPORT = rt("reports", "scoreboard.txt")
-FIELDS = ["date", "equity", "spy_close", "leverage", "drawdown", "broker_equity"]
+FIELDS = ["date", "equity", "spy_close", "leverage", "drawdown", "broker_equity", "flow"]
 
 
 def record(day: dt.date, equity: float, spy_close: float, leverage: float, drawdown: float,
-           broker_equity: float = None):
-    """写入（或覆盖）某一天的记录。同一天重复运行只保留最后一次。"""
+           broker_equity: float = None, flow: float = None):
+    """写入（或覆盖）某一天的记录。同一天重复运行只保留最后一次。
+    flow：当天存取的钱（实盘；None = 模拟盘或没查到，留空）。"""
     rows = read(HISTORY)
     rows = [r for r in rows if r["date"] != f"{day:%Y-%m-%d}"]
     rows.append({"date": f"{day:%Y-%m-%d}", "equity": f"{equity:.2f}", "spy_close": f"{spy_close:.4f}",
                  "leverage": f"{leverage:.3f}", "drawdown": f"{drawdown:.4f}",
-                 "broker_equity": "" if broker_equity is None else f"{broker_equity:.2f}"})
+                 "broker_equity": "" if broker_equity is None else f"{broker_equity:.2f}",
+                 "flow": "" if flow is None else f"{flow:.2f}"})
     rows.sort(key=lambda r: r["date"])
     os.makedirs(os.path.dirname(HISTORY), exist_ok=True)
     with open(HISTORY, "w", newline="", encoding="utf-8") as f:
@@ -92,6 +97,9 @@ def stats(rows: list, spy_by_date: dict) -> dict:
     dates = [r["date"] for r in rows]
     if len(eq) < 2:
         return {"days": len(eq)}
+    if cashflow.has_flows(rows):
+        # 有存取钱：用扣除出入金的净值指数（时间加权），存钱不算赚、取钱不算亏（2026-11-05）
+        eq = cashflow.index_values(rows)
     rets = [eq[i] / eq[i - 1] - 1 for i in range(1, len(eq))]
     peak, mdd = eq[0], 0.0
     for v in eq:
@@ -132,7 +140,12 @@ def overlap_line(systems: dict, spy_by_date: dict):
     for name, r in rows.items():
         a = [x for x in r if x["date"] <= start][-1]          # 共同起点那天（没有就用之前最近的一天）
         b = [x for x in r if x["date"] <= end][-1]
-        parts.append(f"{name.split('（')[0]} {float(b['equity']) / float(a['equity']) - 1:+.2%}")
+        if cashflow.has_flows(r):                              # 有存取钱：用扣除出入金的净值指数
+            idx = dict(zip([x["date"] for x in r], cashflow.index_values(r)))
+            ret = idx[b["date"]] / idx[a["date"]] - 1
+        else:
+            ret = float(b["equity"]) / float(a["equity"]) - 1
+        parts.append(f"{name.split('（')[0]} {ret:+.2%}")
     s0, s1 = _near(spy_by_date, start), _near(spy_by_date, end)
     spy = f"　同期 SPY {s1 / s0 - 1:+.2%}" if s0 and s1 else ""
     return f"同场比较（共同区间 {start}~{end}）：" + "　".join(parts) + spy
@@ -179,6 +192,9 @@ def main():
     both = overlap_line(systems, spy)
     if both:
         lines += ["", both]
+    if runmode.IS_LIVE and cashflow.has_flows(mine):
+        lines += ["", f"出入金：实盘期间共 {cashflow.describe(cashflow.total_flows(mine))}。"
+                      "收益、回撤、波动都已扣除出入金（存钱不算赚，取钱不算亏）；净值是账户里真实的钱。"]
     lines += ["", "提醒：天数少的时候收益主要是运气和大盘方向，至少看 1–3 个月再下结论。"]
     text = "\n".join(lines)
     os.makedirs(os.path.dirname(REPORT), exist_ok=True)

@@ -93,6 +93,75 @@ if scenario == "rotation":
     out["shared_written"] = os.path.exists(scoreboard.MY_SHARED)
     with open(scoreboard.REPORT, encoding="utf-8") as f:
         out["scoreboard"] = f.read()
+elif scenario == "flows":
+    # 出入金（2026-11-05）：先写好前几天的成绩单和券商的入金/出金记录，再跑两次正式换仓、一次监控、一次状态
+    import datetime as dt
+    keys.load_keys = lambda: ("LIVE_K", "LIVE_S")
+    import paper_rotation
+    import scoreboard
+    import monitor
+    import trade
+    today = dt.date.today()
+    day = lambda off: f"{today + dt.timedelta(days=off):%Y-%m-%d}"
+    hist = ARGS.get("history", [])
+    if hist:
+        with open(scoreboard.HISTORY, "w", encoding="utf-8") as f:
+            f.write("date,equity,spy_close,leverage,drawdown,broker_equity\n")
+            for off, eq in hist:
+                f.write(f"{day(off)},{eq:.2f},500.0000,1.000,0.0000,{eq:.2f}\n")
+        with open(paper_rotation.STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump({"start_date": day(hist[0][0]), "start_equity": hist[0][1], "spy_start": 500.0}, f)
+    def when(a):
+        """(日期, 到账时间 UTC)：默认当天美东 02:20；prev_weekday_noon = 上一个工作日中午（上一个收盘之前）。"""
+        if a.get("prev_weekday_noon"):
+            d = today - dt.timedelta(days=1)
+            while d.weekday() >= 5:
+                d -= dt.timedelta(days=1)
+            t = dt.datetime.combine(d, dt.time(12, 0)).astimezone().astimezone(dt.timezone.utc)
+            return f"{d:%Y-%m-%d}", t.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+        return day(a["off"]), f"{day(a['off'])}T07:20:52.48Z"
+    B.activities = [{"id": a.get("id", f"act{i}"), "activity_type": a["type"], "date": when(a)[0],
+                     "created_at": when(a)[1], "net_amount": str(a["amount"]),
+                     "status": a.get("status", "executed"), "description": "type: instant_ach"}
+                    for i, a in enumerate(ARGS.get("activities", []))]
+    if ARGS.get("ledger_raw") is not None:
+        import cashflow
+        with open(cashflow.LEDGER, "w", encoding="utf-8") as f:
+            f.write(ARGS["ledger_raw"])
+    B.activities_error = bool(ARGS.get("activities_error"))
+    paper_rotation.load_keys = keys.load_keys
+    paper_rotation.check_data = lambda *a, **k: ([], True)      # 固定成“今天是交易日”，不依赖今天星期几
+    runs = ARGS.get("runs", 2)
+    outs = []
+    for _ in range(runs):
+        r, e, o = run(paper_rotation.main, ["--live"])
+        outs.append(o)
+        if e:
+            out["error"] = e
+    out.setdefault("error", None)
+    out["result"], out["stdout"] = r, "\n".join(outs)
+    monitor.load_keys = keys.load_keys
+    _, _, out["monitor_stdout"] = run(monitor.main, [])
+    trade.status(trade.broker.client("LIVE_K", "LIVE_S"), ("LIVE_K", "LIVE_S"))
+    with open(os.path.join(trade.ORD_DIR, "status.txt"), encoding="utf-8") as f:
+        out["status_txt"] = f.read()
+    out["history"] = scoreboard.read(scoreboard.HISTORY)
+    import cashflow
+    try:
+        out["ledger"] = cashflow.read_ledger()
+    except Exception as e:                       # 故意弄坏的记录文件
+        out["ledger"] = f"unreadable: {type(e).__name__}"
+    with open(paper_rotation.STATUS_FILE, encoding="utf-8") as f:
+        out["paper_status"] = f.read()
+    out["scoreboard"] = ""                       # 今天没记成绩单时没有这个文件
+    if os.path.exists(scoreboard.REPORT):
+        with open(scoreboard.REPORT, encoding="utf-8") as f:
+            out["scoreboard"] = f.read()
+    import risk
+    out["risk_state"] = risk.load_state()
+    alerts_file = os.path.join(paths.RUNTIME, "alerts.txt")
+    out["alerts"] = open(alerts_file, encoding="utf-8").read() if os.path.exists(alerts_file) else ""
+    out["activity_calls"] = B.activity_calls
 elif scenario == "trade_place":
     keys.load_keys = lambda: ("LIVE_K", "LIVE_S")
     import runpy

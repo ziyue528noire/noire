@@ -91,6 +91,9 @@ class Broker:
         self.paper_flags = []
         self.allow_live = False      # 实盘模式的测试才设 True；否则一旦连实盘就直接报错
         self.price = 100.0
+        self.activities = []         # 账户活动（出入金 CSD/CSW），券商原始格式的字典
+        self.activities_error = False  # True = 查账户活动时网络出错
+        self.activity_calls = []     # 记下查询参数（检查只读查询的写法）
 
     # —— 测试辅助 ——
     def add_order(self, symbol, side, qty, status="accepted", client_order_id=None, when=None, notional=None):
@@ -123,6 +126,16 @@ class TradingClient:
                   regt_buying_power=str(b.regt_buying_power),
                   long_market_value=str(lmv), short_market_value="0",
                   maintenance_margin=str(b.maintenance_margin), status="ACTIVE", trading_blocked=False)
+
+    def get(self, path, data=None):
+        """通用只读查询（真 alpaca-py 的 RESTClient.get）；这里只支持账户活动。"""
+        if path != "/account/activities":
+            raise AssertionError(f"测试没有模拟这个查询：{path}")
+        BROKER.activity_calls.append(dict(data or {}))
+        if BROKER.activities_error:
+            raise ConnectionError("network unreachable")
+        kinds = set(str((data or {}).get("activity_types", "")).split(","))
+        return [dict(a) for a in BROKER.activities if not kinds - {""} or a.get("activity_type") in kinds]
 
     def get_all_positions(self):
         return [NS(symbol=s, qty=str(q), market_value=str(v), avg_entry_price="100", current_price="100",

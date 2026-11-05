@@ -171,11 +171,26 @@ def main():
 
     equity = float(acct.equity)
     last_equity = float(acct.last_equity or 0)
+    # 实盘的出入金（存钱/取钱）：今日涨跌、回撤都扣除，取钱不会误报“今天已亏损”（2026-11-05）
+    day_flow = pending_flow = 0.0
+    if runmode.IS_LIVE:
+        try:
+            import cashflow
+            flows = cashflow.Flows(client)
+            start = cashflow.first_day()
+            if flows.ok:   # 今日 = 券商昨日净值之后到账的钱；回撤 = 还没算进成绩单最后一行的钱
+                day_flow = flows.since(cashflow.prev_close(client, now))
+                pending_flow = flows.unrecorded(start, cashflow.last_day())
+            else:
+                notes.append(f"没查到出入金记录（{flows.error}），今日涨跌没扣除存取的钱")
+        except Exception as e:
+            notes.append(f"查出入金记录出错（{str(e)[:80]}），今日涨跌没扣除存取的钱")
     gross = float(acct.long_market_value or 0) + abs(float(acct.short_market_value or 0))
     maint = float(getattr(acct, "maintenance_margin", 0) or 0)
     lev_now = gross / equity if equity > 0 else 0
-    dd = risk.drawdown_now(equity)["drawdown"]   # 相对最高收盘净值；盘中读数不改最高点
-    day = risk.daily_loss(equity, last_equity)
+    dd = risk.drawdown_now(equity, pending_flow)["drawdown"]   # 相对最高收盘净值；盘中读数不改最高点
+    day = risk.daily_loss_guard(equity, last_equity, day_flow)  # 报警用：取钱不算亏损
+    day_show = risk.day_change(equity, last_equity, day_flow)   # 显示用：扣除今天存取的钱
     dist = risk.margin_distance(equity, gross, maint / gross if gross and maint else None)
 
     if maint and equity < maint:
@@ -207,7 +222,10 @@ def main():
     reconcile(client, {p.symbol for p in pos_list}, found)
     check_last_run(client, found)
 
-    summary = (f"净值 ${equity:,.0f}　今日 {day:+.2%}　杠杆 {lev_now:.2f}x　"
+    if day_flow:
+        import cashflow
+        notes.append(f"今天出入金 {cashflow.describe(day_flow)}，“今日”涨跌已扣除")
+    summary = (f"净值 ${equity:,.0f}　今日 {day_show:+.2%}　杠杆 {lev_now:.2f}x　"
                f"回撤 {dd:.1%}　距追缴 {'—' if gross <= equity else f'{dist:.0%}'}　"
                f"{'开盘中' if clock.is_open else '休市'}")
     try:

@@ -183,6 +183,104 @@ class LiveModeTests(unittest.TestCase):
                              capture_output=True, text=True, timeout=60).stdout.strip()
         self.assertEqual(out, os.path.join(PROJECT, "live"))
 
+    # ---------- 出入金（2026-11-05）：存钱不算赚、取钱不算亏，只读查询，不重复记账 ----------
+    HIST_3000 = [[-3, 3000.0], [-2, 3000.0], [-1, 3000.0]]
+
+    def _today_row(self, r):
+        return r["history"][-1]
+
+    def test_live_deposit_is_not_counted_as_profit(self):
+        acct = {"equity": 3300, "cash": 3300, "last_equity": 3000, "regt": 3300, "bp": 3300}
+        acts = [{"type": "CSD", "off": -10, "amount": 3000, "id": "old"},       # 起点以前存的：已在起点净值里
+                {"type": "CSD", "off": 0, "amount": 300, "id": "new"},
+                {"type": "FEE", "off": 0, "amount": -0.01, "id": "fee"},          # 费用是真实成本，不是出入金
+                {"type": "CSD", "off": 0, "amount": 999, "id": "bounced", "status": "canceled"}]
+        r = scenario("flows", flag=True, config=LIVE_ON, account=acct, history=self.HIST_3000, activities=acts)
+        self.assertIsNone(r["error"])
+        row = self._today_row(r)
+        self.assertEqual(row["equity"], "3300.00")                     # 净值照旧是账户里真实的钱
+        self.assertEqual(row["flow"], "300.00")                        # 跑了两次也只记一次
+        self.assertEqual(sorted((x["id"], x["assigned_to"] == "start") for x in r["ledger"]),
+                         [("new", False), ("old", True)])
+        self.assertIn("策略 +0.00%　同期 SPY", r["paper_status"])           # 仪表盘按这个格式读
+        self.assertIn("（已扣除期间出入金 +$300.00（存钱））", r["paper_status"])
+        self.assertIn("收益 +0.00%", r["scoreboard"])
+        self.assertIn("出入金：实盘期间共 +$300.00（存钱）", r["scoreboard"])
+        self.assertIn("今日 +0.00%", r["monitor_stdout"])
+        self.assertIn("今天出入金 +$300.00（存钱）", r["monitor_stdout"])
+        self.assertIn("今日盈亏：$+0.00（+0.00%）（已扣除今天的出入金 +$300.00（存钱））", r["status_txt"])
+        self.assertTrue(r["orders"])                                    # 新钱照常投进去
+        self.assertTrue(all(c.get("activity_types") == "CSD,CSW" for c in r["activity_calls"]))
+
+    def test_live_withdrawal_is_not_a_loss_and_never_locks_trading(self):
+        acct = {"equity": 2400, "cash": 2400, "last_equity": 3000, "regt": 2400, "bp": 2400}
+        r = scenario("flows", flag=True, config=LIVE_ON, account=acct, history=self.HIST_3000,
+                     activities=[{"type": "CSW", "off": 0, "amount": -600, "id": "out"}])
+        self.assertIsNone(r["error"])
+        self.assertNotIn("今天只允许卖出", r["stdout"])                   # 以前会被当成单日亏 20% → 只卖不买
+        self.assertTrue(any(o["side"] == "buy" for o in r["orders"]))
+        self.assertNotIn("今天已亏损", r["alerts"])                       # 以前盘中会误报
+        self.assertNotIn("回撤", r["alerts"])
+        self.assertEqual(self._today_row(r)["flow"], "-600.00")
+        self.assertEqual(self._today_row(r)["drawdown"], "0.0000")
+        self.assertIn("收益 +0.00%", r["scoreboard"])
+        self.assertIn("最大回撤 0.0%", r["scoreboard"])
+        self.assertAlmostEqual(r["risk_state"]["peak_equity"], 2400.0, places=2)
+
+    def test_live_wrong_deposit_record_never_locks_trading(self):
+        # 券商记录说存了钱，但净值里还没有：扣掉会像亏了 10%——风控绝不因此只卖不买
+        acct = {"equity": 3000, "cash": 3000, "last_equity": 3000, "regt": 3000, "bp": 3000}
+        r = scenario("flows", flag=True, config=LIVE_ON, account=acct, history=self.HIST_3000,
+                     activities=[{"type": "CSD", "off": 0, "amount": 300, "id": "x"}], runs=1)
+        self.assertIsNone(r["error"])
+        self.assertNotIn("今天只允许卖出", r["stdout"])
+        self.assertNotIn("今天已亏损", r["alerts"])
+
+    def test_live_flow_lookup_failure_does_not_stop_trading(self):
+        acct = {"equity": 3300, "cash": 3300, "last_equity": 3000, "regt": 3300, "bp": 3300}
+        r = scenario("flows", flag=True, config=LIVE_ON, account=acct, history=self.HIST_3000,
+                     activities=[{"type": "CSD", "off": 0, "amount": 300}], activities_error=True, runs=1)
+        self.assertIsNone(r["error"])
+        self.assertEqual(r["result"], "ok")
+        self.assertTrue(r["orders"])
+        self.assertEqual(len(r["history"]), 3)                          # 不知道存取了多少 → 今天先不记成绩单
+        self.assertIsNone(r["ledger"])
+        self.assertIn("没查到出入金记录", r["paper_status"])
+        self.assertEqual(r["alerts"], "")                               # 网络问题不推送警报
+
+    def test_live_old_withdrawal_does_not_hide_a_real_loss(self):
+        # 上一个交易日收盘前取的钱：券商的“昨日净值”已经扣过了。就算那天没记成绩单，今天也不能再扣一次——
+        # 否则真实的 -8% 会被算成 +3%，单日亏损 5% 的“只卖不买”就失效了
+        acct = {"equity": 2484, "cash": 2484, "last_equity": 2700, "regt": 2484, "bp": 2484}
+        r = scenario("flows", flag=True, config=LIVE_ON, account=acct, history=[[-10, 3000.0], [-9, 3000.0]],
+                     activities=[{"type": "CSW", "prev_weekday_noon": True, "amount": -300, "id": "w"}], runs=1)
+        self.assertIsNone(r["error"])
+        self.assertIn("今天只允许卖出", r["stdout"])
+        self.assertIn("今天已亏损", r["alerts"])
+        self.assertEqual(self._today_row(r)["flow"], "-300.00")         # 成绩单：漏记那几天的钱算进今天这一行
+
+    def test_live_broken_flow_file_does_not_stop_trading(self):
+        acct = {"equity": 3300, "cash": 3300, "last_equity": 3000, "regt": 3300, "bp": 3300}
+        r = scenario("flows", flag=True, config=LIVE_ON, account=acct, history=self.HIST_3000,
+                     activities=[{"type": "CSD", "off": 0, "amount": 300, "id": "new"}], runs=1,
+                     ledger_raw="id,created_at,date,type,amount,assigned_to\n\"unclosed,quote\n" + "x" * 200000)
+        self.assertIsNone(r["error"])
+        self.assertEqual(r["result"], "ok")
+        self.assertTrue(r["orders"])                                    # 照常下单
+        self.assertEqual(len(r["history"]), 3)                          # 今天先不记成绩单
+        self.assertIn("出入金记录出错", r["alerts"])                      # 推送提醒去检查
+
+    def test_live_first_run_counts_only_money_after_start(self):
+        # 第一次用（还没有出入金记录文件）：起点那天及以前存的钱都算在起点里，只有之后的才记
+        acct = {"equity": 3000, "cash": 3000, "last_equity": 3000, "regt": 3000, "bp": 3000}
+        acts = [{"type": "CSD", "off": -3, "amount": 1000, "id": "a"},
+                {"type": "CSD", "off": -20, "amount": 2000, "id": "b"}]
+        r = scenario("flows", flag=True, config=LIVE_ON, account=acct, history=self.HIST_3000, activities=acts,
+                     runs=1)
+        self.assertEqual(self._today_row(r)["flow"], "0.00")
+        self.assertEqual({x["assigned_to"] for x in r["ledger"]}, {"start"})
+        self.assertNotIn("出入金：", r["scoreboard"])
+
     # ---------- 实盘警报抄送到本文件夹的 alerts.txt（手机推送的定时任务只读这个文件）----------
     def test_live_alerts_are_copied_for_phone_push(self):
         mirror = os.path.join(tempfile.mkdtemp(prefix="noire_mirror_"), "alerts.txt")

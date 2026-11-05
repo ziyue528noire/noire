@@ -88,6 +88,13 @@ def daily_tracking(root, data_dir=None):
     if len(hist) < 2 or not targets:
         return pd.DataFrame(), targets
     eq = pd.Series({dt.date.fromisoformat(r["date"]): float(r["equity"]) for r in hist}).sort_index()
+    # flow 列 = 当天存取的钱（实盘，2026-11-05 起）；实际收益扣除它，存钱不算赚、取钱不算亏
+    flow = {}
+    for r in hist:
+        try:
+            flow[dt.date.fromisoformat(r["date"])] = float(r.get("flow") or 0.0)
+        except (TypeError, ValueError):
+            pass
     symbols = sorted({s for w in targets.values() for s in w} | {"SPY"})
     opens, closes = load_prices(root, symbols, data_dir)
     if closes.empty:
@@ -113,7 +120,7 @@ def daily_tracking(root, data_dir=None):
         except KeyError:
             continue
         model = (1 + r_night) * (1 + r_day) - 1
-        actual = eq[d] / eq[p] - 1
+        actual = (eq[d] - flow.get(d, 0.0)) / eq[p] - 1
         dn, do = latest_on_or_before(dips, p) or 0.0, latest_on_or_before(dips, pp) or 0.0
         try:
             dip = do * (opens.at[d, "SPY"] / closes.at[p, "SPY"] - 1) + dn * (closes.at[d, "SPY"] / opens.at[d, "SPY"] - 1)

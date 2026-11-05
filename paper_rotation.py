@@ -31,6 +31,7 @@ import broker
 import risk
 import ledger
 import alerts
+import cashflow
 import scoreboard
 import aplus
 import dipbuy
@@ -189,8 +190,26 @@ def main():
     if manual_value:
         print(f"手动持仓（策略不管）：${manual_value:,.0f}")
 
+    # 实盘的出入金（存钱/取钱）：只读查券商记录，收益和风控都不把它当成赚亏（2026-11-05）。出任何错都不影响交易
+    flows, flow_start, day_flow, flow_broken = None, None, 0.0, False
+    if runmode.IS_LIVE:
+        try:
+            flows = cashflow.Flows(client)
+            flow_start = cashflow.first_day()
+            if flows.ok:          # “今天”= 券商昨日净值（上一个交易日收盘）之后到账的钱
+                day_flow = flows.since(cashflow.prev_close(client, now))
+        except Exception as e:    # 例如记录文件被手改坏了
+            flows, day_flow, flow_broken = cashflow.Flows.unknown(f"{type(e).__name__}: {str(e)[:120]}"), 0.0, True
+        if not flows.ok:
+            sig_lines.append(f"⚠ 没查到出入金记录（{flows.error}）；今天先不记成绩单，下一次运行连同今天一起补上")
+        elif day_flow:
+            sig_lines.append(f"出入金：今天 {cashflow.describe(day_flow)}，不算收益；成绩单、回撤、单日涨跌都已扣除")
+        if day_flow or not flows.ok:
+            print(sig_lines[-1])
+
     # 风控：单日亏损过大当天不买（杠杆已由 aplus 的波动目标 + 趋势开关决定，上限 2 倍）
-    day_chg = risk.daily_loss(equity, float(acct.last_equity or 0))
+    # 取钱不会被当成亏损；存钱照旧按券商原始数字（见 risk.daily_loss_guard）
+    day_chg = risk.daily_loss_guard(equity, float(acct.last_equity or 0), day_flow)
     no_buy = day_chg < -config.DAILY_LOSS_LIMIT
     if no_buy:
         print(f"风控：今天亏损 {day_chg:.1%}，超过 {config.DAILY_LOSS_LIMIT:.0%} 上限，今天只允许卖出")
@@ -205,9 +224,31 @@ def main():
     eq_close = equity if data_notes else close_equity(cash, all_pos, closes.iloc[-1])
     if live and trading_today is not False:   # 成绩单：每个交易日记一行（休市日不记；第一次会先补上起点那一天）
         gross = sum(v for q, v in all_pos.values())
-        record_score(now.date(), eq_close, float(closes["SPY"].iloc[-1]),
-                     gross / equity if equity else 0, risk.update_peak(eq_close, now.date())["drawdown"],
-                     broker_equity=equity)   # 回撤用收盘净值（和成绩单、仪表盘一致）
+        flow_today, skip_score = None, False  # 模拟盘没有出入金（flow 留空）
+        if flows is not None:
+            if flows.ok:
+                try:   # 今天这一行的出入金 = 上一次记成绩单以后到账的（中间漏记的几天也一起算进来）
+                    flow_today = flows.assign(now.date(), flow_start, cashflow.last_day(before=now.date()))
+                except Exception as e:
+                    flow_broken = True
+                    print(f"记录出入金失败（不影响交易）：{e}")
+            if flow_today is None:
+                # 不知道今天存取了多少钱 → 今天先不记成绩单（记了会把存取的钱算成赚亏），下一次运行连同今天一起补上
+                skip_score = True
+                print("出入金没查到/没记上，今天先不记成绩单（不影响交易）")
+                if flows.ok:
+                    sig_lines.append("⚠ 出入金没记上，今天先不记成绩单，下一次运行连同今天一起补上")
+            if flow_broken and live:
+                alerts.add("自动换仓：出入金记录出错（live\\cash_flows.csv 可能被改坏了），今天的成绩单没记；"
+                           "交易照常。请让 Claude 检查", popup=False)
+        if not skip_score:
+            try:
+                dd = risk.update_peak(eq_close, now.date(), flow=flow_today or 0.0)["drawdown"]
+            except Exception as e:            # 成绩单文件被手改坏等：回撤先记 0，不影响交易
+                print(f"计算回撤失败（不影响交易）：{e}")
+                dd = 0.0
+            record_score(now.date(), eq_close, float(closes["SPY"].iloc[-1]), gross / equity if equity else 0, dd,
+                         broker_equity=equity, flow=flow_today)   # 回撤用收盘净值（和成绩单、仪表盘一致）
 
     open_orders = [o for o in client.get_orders(GetOrdersRequest(status=QueryOrderStatus.OPEN))
                    if o.symbol in managed]
@@ -216,7 +257,7 @@ def main():
         for o in open_orders:
             print(f"  待成交：{o.side.value} {ledger.size_text(o)} {o.symbol}")
         write_status(equity, positions, target, sig_lines, ["有未成交订单，跳过"], closes, live, risk_line=risk_line,
-                     close_eq=eq_close)
+                     close_eq=eq_close, new_flow=_unrecorded(flows, flow_start))
         return "ok"
 
     # ---- 3. 算出要买卖什么 ----
@@ -352,11 +393,20 @@ def main():
     elif orders:
         print("（空跑，没有下单。加 --live 才会提交）")
 
-    write_status(equity, positions, target, sig_lines, actions, closes, live, risk_line=risk_line, close_eq=eq_close)
+    write_status(equity, positions, target, sig_lines, actions, closes, live, risk_line=risk_line, close_eq=eq_close,
+                 new_flow=_unrecorded(flows, flow_start))
     return "blocked" if stopped else "ok"
 
 
-def record_score(day, equity, spy_close, leverage, drawdown, broker_equity=None):
+def _unrecorded(flows, start):
+    """还没算进成绩单最后一行的出入金（状态页“自起点”用）；模拟盘、查不到、出错都按 0。"""
+    try:
+        return flows.unrecorded(start, cashflow.last_day()) if flows is not None and flows.ok else 0.0
+    except Exception:
+        return 0.0
+
+
+def record_score(day, equity, spy_close, leverage, drawdown, broker_equity=None, flow=None):
     try:
         if not scoreboard.read(scoreboard.HISTORY) and os.path.exists(STATE_FILE):
             with open(STATE_FILE, encoding="utf-8") as f:
@@ -364,7 +414,7 @@ def record_score(day, equity, spy_close, leverage, drawdown, broker_equity=None)
             start = dt.date.fromisoformat(st["start_date"])
             if start < day:
                 scoreboard.record(start, float(st["start_equity"]), float(st["spy_start"]), 0.0, 0.0)
-        scoreboard.record(day, equity, spy_close, leverage, drawdown, broker_equity)
+        scoreboard.record(day, equity, spy_close, leverage, drawdown, broker_equity, flow=flow)
         scoreboard.main()
     except Exception as e:
         print(f"成绩单记录失败（不影响交易）：{e}")
@@ -394,10 +444,12 @@ def log_trade(when, sym, side, qty, ref_price, why):
         f.write(f"{when:%Y-%m-%d %H:%M},{sym},{side},{qty:g},{ref_price:.2f},{why}\n")
 
 
-def write_status(equity, positions, target, sig_lines, actions, closes, live=False, risk_line="", close_eq=None):
+def write_status(equity, positions, target, sig_lines, actions, closes, live=False, risk_line="", close_eq=None,
+                 new_flow=0.0):
     """生成一页状态报告，并和“同期一直持有 SPY”比较。
     正式运行写 paper_status.txt；空跑写 paper_status_dryrun.txt（以前空跑会覆盖正式状态，日报/周报会读错）。
-    close_eq：收盘净值。有它时“账户净值”和“自起点”都用它（和成绩单一致），券商当时的读数另外注明（2026-10-20）。"""
+    close_eq：收盘净值。有它时“账户净值”和“自起点”都用它（和成绩单一致），券商当时的读数另外注明（2026-10-20）。
+    new_flow：还没算进成绩单最后一行的出入金（空跑时今天新存取的钱）。实盘有出入金时“自起点”按扣除出入金算（2026-11-05）。"""
     spy_now = float(closes["SPY"].iloc[-1])
     shown = equity if close_eq is None else float(close_eq)
     state = {}
@@ -421,9 +473,21 @@ def write_status(equity, positions, target, sig_lines, actions, closes, live=Fal
              "本次操作：", *[f"  {a}" for a in actions]]
     if state:
         mine = shown / state["start_equity"] - 1
+        flow_note = ""
+        if runmode.IS_LIVE:
+            try:
+                rows = scoreboard.read(scoreboard.HISTORY)
+                if rows and (cashflow.has_flows(rows) or abs(new_flow or 0.0) >= 0.005):
+                    # 和成绩单同一个算法：净值指数（时间加权），存钱不算赚、取钱不算亏
+                    last = float(rows[-1]["equity"])
+                    if last > 0:
+                        mine = cashflow.index_values(rows)[-1] * ((shown - (new_flow or 0.0)) / last) - 1
+                    flow_note = f"（已扣除期间出入金 {cashflow.describe(cashflow.total_flows(rows) + (new_flow or 0.0))}）"
+            except Exception as e:            # 成绩单文件被手改坏：退回原来的算法
+                print(f"按出入金调整“自起点”失败：{e}")
         spy = spy_now / state["spy_start"] - 1
         lines += ["", f"自 {state['start_date']} 起：策略 {mine:+.2%}　同期 SPY {spy:+.2%}　"
-                      f"{'领先' if mine >= spy else '落后'} {abs(mine - spy):.2%}"]
+                      f"{'领先' if mine >= spy else '落后'} {abs(mine - spy):.2%}{flow_note}"]
     path = STATUS_FILE if live else DRYRUN_STATUS_FILE
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:

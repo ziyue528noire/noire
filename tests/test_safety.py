@@ -80,6 +80,7 @@ import trade                             # noqa: E402
 import monitor                           # noqa: E402
 import emergency                         # noqa: E402
 import scoreboard                        # noqa: E402
+import cashflow                          # noqa: E402
 import paper_job                         # noqa: E402
 paper_job.run_preflight = lambda: True    # 测试里不再递归运行整套测试
 for m in (paper_rotation, trade, monitor, emergency):
@@ -567,6 +568,170 @@ class SafetyTests(unittest.TestCase):
 import aplus                             # noqa: E402
 
 
+class CashFlowTests(unittest.TestCase):
+    """出入金（2026-11-05）：收益、回撤、单日涨跌都不把存钱当赚、取钱当亏；模拟盘完全不变。"""
+
+    def setUp(self):
+        shutil.rmtree(paths.RUNTIME, ignore_errors=True)
+        os.makedirs(paths.RUNTIME)
+        B.reset()
+
+    @staticmethod
+    def rows(*items):
+        return [{"date": d, "equity": f"{e:.2f}", "flow": "" if f is None else f"{f:.2f}"} for d, e, f in items]
+
+    def test_returns_exclude_deposits_and_withdrawals(self):
+        rows = self.rows(("2026-11-02", 700, None), ("2026-11-03", 710, 0), ("2026-11-04", 1010, 300),
+                         ("2026-11-05", 1020, 0), ("2026-11-06", 820, -200))
+        idx = cashflow.index_values(rows)
+        self.assertAlmostEqual(idx[2], 710 / 700)                         # 存 300：当天收益 0
+        self.assertAlmostEqual(idx[4], idx[3])                            # 取 200：当天收益 0
+        s = scoreboard.stats(rows, {})
+        self.assertAlmostEqual(s["total"], 710 / 700 * 1020 / 1010 - 1)
+        self.assertEqual(s["max_dd"], 0.0)                                # 取钱不是回撤
+        self.assertLess(s["vol"], 0.5)                                    # 不再出现 +42% 的“一天”
+        self.assertAlmostEqual(cashflow.total_flows(rows), 100.0)
+        # 第一天的出入金已经算在起点里，不影响任何结果
+        self.assertFalse(cashflow.has_flows(self.rows(("2026-11-02", 700, 700), ("2026-11-03", 710, None))))
+
+    def test_rows_without_flows_compute_exactly_as_before(self):
+        rows = [{"date": "2026-01-02", "equity": "100000"}, {"date": "2026-01-05", "equity": "93000"},
+                {"date": "2026-01-06", "equity": "99000"}]
+        s = scoreboard.stats(rows, {})
+        self.assertEqual(s["total"], 99000 / 100000 - 1)                  # 完全相同的算式（不是近似）
+        self.assertEqual(s["max_dd"], 93000 / 100000 - 1)
+        self.assertEqual(cashflow.index_values(rows)[1], 93000 / 100000)
+
+    def test_head_to_head_uses_flow_adjusted_returns(self):
+        a = self.rows(("2026-01-02", 100, None), ("2026-01-05", 210, 100), ("2026-01-06", 210, 0))
+        b = [{"date": "2026-01-02", "equity": "60"}, {"date": "2026-01-06", "equity": "66"}]
+        line = scoreboard.overlap_line({"甲": a, "乙": b}, {})
+        self.assertEqual(line, "同场比较（共同区间 2026-01-02~2026-01-06）：甲 +10.00%　乙 +10.00%")
+
+    def _history(self, items):
+        with open(risk.HISTORY_FILE, "w", encoding="utf-8") as f:
+            f.write("date,equity,spy_close,leverage,drawdown,broker_equity,flow\n")
+            for d, e, fl in items:
+                flow = "" if fl is None else f"{fl:.2f}"
+                f.write(f"{d},{e:.2f},500,1.0,0.0,{e:.2f},{flow}\n")
+
+    def test_deposit_does_not_hide_drawdown_and_withdrawal_is_not_one(self):
+        self._history([("2026-11-02", 1000, None), ("2026-11-03", 1100, None), ("2026-11-04", 900, None)])
+        info = risk.update_peak(1400, dt.date(2026, 11, 5), flow=500)     # 亏着的时候存 500
+        self.assertAlmostEqual(info["drawdown"], 1 - 900 / 1100)           # 以前会变成 0（1400 > 1100）
+        self.assertAlmostEqual(info["peak"], 1400 * 1100 / 900)
+        self.assertAlmostEqual(risk.drawdown_now(1400, pending_flow=500)["drawdown"], 1 - 900 / 1100)
+        self._history([("2026-11-02", 1000, None), ("2026-11-03", 1000, None)])
+        self.assertEqual(risk.update_peak(600, dt.date(2026, 11, 4), flow=-400)["drawdown"], 0.0)  # 以前是 40%
+        self.assertEqual(risk.drawdown_now(600, pending_flow=-400)["drawdown"], 0.0)
+        # 取钱那天记进成绩单以后，第二天盘中的回撤也正确
+        self._history([("2026-11-02", 1000, None), ("2026-11-03", 1000, None), ("2026-11-04", 600, -400)])
+        self.assertEqual(risk.drawdown_now(600)["drawdown"], 0.0)
+        self.assertAlmostEqual(risk.drawdown_now(540)["drawdown"], 0.10)
+
+    def test_daily_loss_guard_only_moves_toward_fewer_false_alarms(self):
+        self.assertEqual(risk.daily_loss_guard(2400, 3000, -600), 0.0)            # 取钱：不算亏损
+        self.assertAlmostEqual(risk.daily_loss_guard(3300, 3000, 300), 0.10)     # 存钱：按原始数字（不会更严）
+        self.assertEqual(risk.daily_loss_guard(3000, 3000, 300), 0.0)            # 入金记录有误：也不会误锁
+        self.assertAlmostEqual(risk.daily_loss_guard(2800, 3000, 0), 2800 / 3000 - 1)
+        self.assertEqual(risk.day_change(3300, 3000, 300), 0.0)                  # 显示的今日涨跌：扣除存取
+        self.assertEqual(risk.day_change(2800, 3000), risk.daily_loss(2800, 3000))
+
+    def test_flow_records_are_read_only_deduplicated_and_skip_money_before_start(self):
+        self._history([("2026-11-02", 700, None), ("2026-11-03", 700.79, None), ("2026-11-04", 711.48, None)])
+        B.activities = [
+            {"id": "a1", "activity_type": "CSD", "date": "2026-10-21", "created_at": "2026-10-21T19:29:50Z",
+             "net_amount": "300", "status": "executed"},
+            {"id": "a2", "activity_type": "CSD", "date": "2026-10-29", "created_at": "2026-10-29T20:21:08Z",
+             "net_amount": "400", "status": "executed"},
+            {"id": "a3", "activity_type": "CSD", "date": "2026-11-05", "created_at": "2026-11-05T07:20:52Z",
+             "net_amount": "300", "status": "executed"},
+            {"id": "f1", "activity_type": "FEE", "date": "2026-11-03", "created_at": "2026-11-04T01:12:36Z",
+             "net_amount": "-0.01", "status": "executed"},
+        ]
+        client = fakebroker.TradingClient("k", "s")
+        start = cashflow.first_day()
+        self.assertEqual(start, "2026-11-02")
+        fl = cashflow.Flows(client, enabled=True)
+        self.assertTrue(fl.ok)
+        self.assertEqual(fl.pending(start), 300.0)
+        self.assertEqual(fl.unrecorded(start, "2026-11-04"), 300.0)
+        self.assertEqual(fl.assign("2026-11-05", start, "2026-11-04"), 300.0)
+        led = cashflow.read_ledger()
+        self.assertEqual({r["id"]: r["assigned_to"] for r in led},
+                         {"a1": "start", "a2": "start", "a3": "2026-11-05"})
+        fl2 = cashflow.Flows(client, enabled=True)
+        self.assertEqual(fl2.pending(start), 0.0)
+        self.assertEqual(fl2.assign("2026-11-05", start, "2026-11-04"), 300.0)  # 同一天重跑：不会记两次
+        self.assertEqual(len(cashflow.read_ledger()), 3)
+        B.activities.append({"id": "w1", "activity_type": "CSW", "date": "2026-11-05",
+                             "created_at": "2026-11-05T15:00:00Z", "net_amount": "-50", "status": "executed"})
+        fl3 = cashflow.Flows(client, enabled=True)
+        self.assertEqual(fl3.pending(start), -50.0)                          # 取钱为负
+        # 11-05 那一行没记成（比如成绩单文件当时打不开）：11-06 那一行把 11-05 记进文件的钱一起算上
+        self.assertEqual(fl3.unrecorded(start, "2026-11-04"), 250.0)
+        self.assertEqual(fl3.assign("2026-11-06", start, "2026-11-04"), 250.0)
+        self.assertEqual(fl3.unrecorded(start, "2026-11-06"), 0.0)
+        # “今日涨跌”按到账时间算：上一个收盘之后到账的才算今天的
+        cut = dt.datetime(2026, 11, 4, 16, 0, tzinfo=dt.timezone(dt.timedelta(hours=-5)))
+        self.assertEqual(fl3.since(cut), 250.0)
+        self.assertEqual(fl3.since(cut + dt.timedelta(hours=12)), -50.0)       # 11-05 05:00 之后只有那笔取钱
+        self.assertEqual(B.orders, [])                                       # 只读：从不下单
+
+    def test_hand_edited_flow_file_is_tolerated(self):
+        # Excel 改过的日期（2026/11/5）、全角减号、美元符号都认得；看不懂的行跳过，不会让换仓出错
+        with open(cashflow.LEDGER, "w", encoding="gbk") as f:
+            f.write("id,created_at,date,type,amount,assigned_to\n"
+                    "m1,手动补记,2026-11-05,CSW,－300,2026/11/5\n"
+                    "m2,手动,2026-11-05,CSD,\"$1,000.00\",2026-11-05\n"
+                    "bad,手动,2026-11-05,CSD,abc,2026-11-05\n"
+                    "old,x,2026-10-01,CSD,500,start\n")
+        fl = cashflow.Flows(fakebroker.TradingClient("k", "s"), enabled=True)
+        self.assertEqual(fl.unrecorded("2026-11-02", "2026-11-04"), 700.0)
+        self.assertTrue(any("bad" in w for w in fl.warnings))
+        self.assertEqual(cashflow._amount("−300"), -300.0)                     # describe() 打印的减号
+        self.assertIsNone(cashflow._amount("abc"))
+
+    def test_prev_close_uses_calendar_and_safe_fallback(self):
+        client = fakebroker.TradingClient("k", "s")
+        mon = dt.datetime(2026, 11, 9, 17, 10)
+        self.assertEqual(cashflow.prev_close(client, mon).replace(tzinfo=None), dt.datetime(2026, 11, 6, 16, 0))
+        orig = fakebroker.TradingClient.get_calendar
+        fakebroker.TradingClient.get_calendar = lambda self, req: (_ for _ in ()).throw(ConnectionError("x"))
+        try:   # 日历查不到：上一个工作日 16:00（只会比真实收盘晚 → 少扣，回到以前的算法）
+            self.assertEqual(cashflow.prev_close(client, mon).replace(tzinfo=None), dt.datetime(2026, 11, 6, 16, 0))
+            self.assertEqual(cashflow.prev_close(client, dt.datetime(2026, 11, 5, 9, 47)).replace(tzinfo=None),
+                             dt.datetime(2026, 11, 4, 16, 0))
+        finally:
+            fakebroker.TradingClient.get_calendar = orig
+
+    def test_flow_lookup_failure_and_paper_mode(self):
+        client = fakebroker.TradingClient("k", "s")
+        B.activities_error = True
+        fl = cashflow.Flows(client, enabled=True)
+        self.assertFalse(fl.ok)
+        self.assertEqual((fl.pending(), fl.unrecorded(), fl.since(dt.datetime(2000, 1, 1, tzinfo=dt.timezone.utc))),
+                         (0.0, 0.0, 0.0))
+        self.assertIsNone(fl.assign("2026-11-05"))
+        self.assertIsNone(cashflow.read_ledger())
+        calls = len(B.activity_calls)
+        self.assertEqual(calls, 2)                                           # 失败时最多再试一次
+        B.activities_error = False
+        self.assertTrue(cashflow.Flows(client).ok)                           # 模拟盘：不查询
+        self.assertEqual(len(B.activity_calls), calls)
+        self.assertEqual(B.activity_calls[0]["activity_types"], "CSD,CSW")
+
+    def test_paper_rotation_never_queries_flows_and_leaves_flow_blank(self):
+        orig = paper_rotation.check_data
+        paper_rotation.check_data = lambda *a, **k: ([], True)
+        try:
+            run(paper_rotation.main, "--live")
+        finally:
+            paper_rotation.check_data = orig
+        self.assertEqual(B.activity_calls, [])
+        self.assertEqual(scoreboard.read(scoreboard.HISTORY)[-1]["flow"], "")
+
+
 def synthetic(rets, n=400, start="2024-01-01"):
     """按每只的“日收益序列生成器”造价格表：rets = {代码: 函数(i) -> 第 i 天收益}，没列出的保持不变。"""
     idx = pd.bdate_range(start, periods=n)
@@ -739,6 +904,17 @@ class TrackingTests(unittest.TestCase):
         sl = tracking.slippage(root)
         self.assertEqual(len(sl), 1)                                          # 部分成交 + 全部成交只算一笔
         self.assertAlmostEqual(float(sl["bps"].iloc[0]), 10.0, places=3)     # 比开盘价贵 0.1% = 10 个基点
+        # 中途存了 5000：净值跳一下，但 flow 列记下了 → 对账照样相差 0（2026-11-05）
+        eq2 = eq[:2]
+        for i in range(2, len(eq)):                 # 存进来的钱之后跟着一起涨跌
+            eq2.append(eq2[-1] * eq[i] / eq[i - 1] + (5000 if i == 6 else 0))
+        with open(os.path.join(root, "equity_history.csv"), "w", encoding="utf-8") as f:
+            f.write("date,equity,flow\n" + "".join(f"{d.date()},{e:.6f},{5000 if i == 6 else ''}\n"
+                                                for i, (d, e) in enumerate(zip(idx, eq2))))
+        tr2, _ = tracking.daily_tracking(root)
+        self.assertLess(float(tr2["diff"].abs().max()), 1e-6)
+        with open(os.path.join(root, "equity_history.csv"), "w", encoding="utf-8") as f:
+            f.write("date,equity\n" + "".join(f"{d.date()},{e:.6f}\n" for d, e in zip(idx, eq)))
         text = tracking.report(root)
         self.assertIn("对账天数 10", text)
         self.assertIn("按金额加权 +10.0 个基点", text)
