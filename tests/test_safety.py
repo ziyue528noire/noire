@@ -565,6 +565,172 @@ class SafetyTests(unittest.TestCase):
         self.assertTrue(paper_job.load_state(f"{dt.date.today():%Y-%m-%d}")["success"])
 
 
+class CloseDataTests(unittest.TestCase):
+    """1.0.2（2026-11-07）：一定要用当天的收盘价。
+    行情还没更新到今天的收盘价 → 等下一次自动运行；工作日 16:30 以前不换仓；换仓前和 Alpaca 的日线收盘价核对。"""
+
+    MONDAY = dt.date(2026, 11, 9)
+    SATURDAY = dt.date(2026, 11, 7)
+
+    def setUp(self):
+        shutil.rmtree(paths.RUNTIME, ignore_errors=True)
+        os.makedirs(paths.RUNTIME)
+        B.reset()
+
+    def tearDown(self):
+        make_data()                                           # 有的测试把 GLD 改成少一天，这里恢复
+
+    @staticmethod
+    def job(hour, minute, day=None):
+        rc = []
+        out = run(lambda: rc.append(paper_job.main(dt.datetime.combine(day or dt.date.today(), dt.time(hour, minute)))))
+        return rc[0], out
+
+    @staticmethod
+    def alerts_text():
+        p = os.path.join(paths.RUNTIME, "alerts.txt")
+        if not os.path.exists(p):
+            return ""
+        with open(p, encoding="utf-8") as f:
+            return f.read()
+
+    @staticmethod
+    def state():
+        return paper_job.load_state(f"{dt.date.today():%Y-%m-%d}")
+
+    @staticmethod
+    def gld_one_day_short():
+        """GLD 少了最新一天（Yahoo 还没更新完）→“行情不完整”。不管今天星期几、现在几点都一样。"""
+        write_prices("GLD", fake_path(DRIFT["GLD"])[:-1], fake_index()[:-1])
+
+    # —— 行情没更新：先等，最后一次才按前一天的价格 ——
+    def test_stale_data_waits_for_the_next_run_then_falls_back(self):
+        self.gld_one_day_short()
+        rc, out = self.job(17, 0)
+        self.assertIn("行情还没更新好", out)
+        self.assertIn("30 分钟后自动再试", out)
+        self.assertNotIn("Traceback", out)                    # 不是程序出错，不打印错误详情
+        self.assertEqual(B.orders, [])                        # 第 1 次：不换仓
+        self.assertEqual(B.bar_requests, [])                  # 行情不全时也不做收盘价核对
+        self.assertEqual(self.alerts_text(), "")              # 也不报警
+        st = self.state()
+        self.assertEqual((st["attempts"], st["success"], st["history"][-1]["result"]), (1, False, "retry"))
+        self.job(17, 30)
+        self.assertEqual(B.orders, [])                        # 第 2 次：还是等
+        self.assertEqual(self.alerts_text(), "")
+        rc, out = self.job(18, 0)                             # 第 3 次 = 今天最后一次：按前一天的价格换仓并报警
+        self.assertEqual(rc, 0)
+        self.assertTrue(B.orders)
+        self.assertIn("行情不完整：GLD", self.alerts_text())
+        self.assertTrue(self.state()["success"])
+
+    def test_stale_data_trades_once_the_close_arrives(self):
+        self.gld_one_day_short()
+        self.job(17, 0)
+        self.assertEqual(B.orders, [])
+        make_data()                                           # 17:30 Yahoo 更新好了
+        rc, out = self.job(17, 30)
+        self.assertIn("第 2 次尝试成功（前面 1 次在等行情更新", out)
+        self.assertTrue(B.orders)
+        self.assertEqual(self.alerts_text(), "")              # 等到了就不报警
+
+    def test_last_run_of_the_day_does_not_wait(self):
+        self.gld_one_day_short()
+        self.job(18, 10)                                      # 例如电脑 18:10 才醒：第 1 次就是今天最后一次
+        self.assertTrue(B.orders)
+        self.assertIn("行情不完整：GLD", self.alerts_text())
+
+    def test_failure_on_the_last_run_alerts_right_away(self):
+        orig = paper_job.run_rotation
+        paper_job.run_rotation = lambda: (_ for _ in ()).throw(ConnectionError("read timed out"))
+        try:
+            rc, out = self.job(18, 10)
+        finally:
+            paper_job.run_rotation = orig
+        self.assertEqual(rc, 1)
+        self.assertIn("今天后面没有自动运行了", self.alerts_text())  # 以前要失败满 3 次才报警，这种情况会漏报
+        self.assertNotIn("30 分钟后", out)
+
+    # —— 工作日白天不换仓 ——
+    def test_no_trading_before_the_close_is_out(self):
+        calls, orig = [], paper_job.run_rotation
+        paper_job.run_rotation = lambda: calls.append(1) or "ok"
+        try:
+            for h, m in ((0, 30), (9, 0), (11, 0), (16, 29)):
+                rc, out = self.job(h, m, self.MONDAY)
+                self.assertEqual(rc, 0)
+                self.assertIn("16:30 以前不换仓", out)
+                self.assertIn("17:00 会自动运行", out)
+            self.assertEqual(calls, [])                        # 不换仓
+            self.assertFalse(os.path.exists(paper_job.STATE))  # 也不算一次尝试：傍晚照常有 3 次机会
+            self.assertFalse(os.path.exists(paper_job.LOCK))
+            self.job(16, 30, self.MONDAY)
+            self.assertEqual(len(calls), 1)                    # 16:30 以后照常
+            self.job(11, 0, self.SATURDAY)
+            self.assertEqual(len(calls), 2)                    # 周末白天可以（用的是星期五的收盘价）
+        finally:
+            paper_job.run_rotation = orig
+
+    # —— 和 Alpaca 核对收盘价：只报警，不影响交易 ——
+    @staticmethod
+    def alpaca_bars(**override):
+        as_of = fake_index()[-1].date()
+        B.bars = {s: {as_of: last_price(s)} for s in DRIFT}
+        for s, px in override.items():
+            B.bars[s] = {as_of: px}
+
+    def test_close_cross_check_is_quiet_when_prices_agree(self):
+        self.alpaca_bars()
+        out = run(paper_rotation.main, "--live")
+        self.assertIn(f"收盘价核对：{len(DRIFT)} 只和 Alpaca（sip）一致", out)
+        self.assertEqual(self.alerts_text(), "")
+        self.assertTrue(B.orders)
+        req = B.bar_requests[0]
+        self.assertEqual(req.feed.value, "sip")
+        self.assertEqual(sorted(req.symbol_or_symbols), sorted(config.ROTATION_UNIVERSE + [config.CASH_SYMBOL]))
+
+    def test_close_cross_check_alerts_but_still_trades(self):
+        self.alpaca_bars(QQQ=95.0)                             # Yahoo 100，Alpaca 95
+        run(paper_rotation.main, "--live")
+        self.assertIn("收盘价核对不一致", self.alerts_text())
+        self.assertIn("QQQ Yahoo 100.00 / Alpaca 95.00（差 +5.3%）", self.alerts_text())
+        self.assertTrue(B.orders)                              # 只报警，照常换仓
+        with open(paper_rotation.STATUS_FILE, encoding="utf-8") as f:
+            self.assertIn("⚠ 收盘价核对不一致", f.read())      # 状态页也写明
+
+    def test_close_cross_check_never_blocks_trading(self):
+        import pricecheck
+        as_of, now = dt.date(2026, 11, 6), dt.datetime(2026, 11, 6, 22, 10, tzinfo=dt.timezone.utc)
+        yahoo = pd.Series({"SPY": 500.0, "QQQ": 400.0})
+        B.bars = {"SPY": {as_of: 500.5}, "QQQ": {as_of: 400.0}}
+        B.bars_error = {"sip": Exception('{"message":"subscription does not permit querying recent SIP data"}')}
+        same, line = pricecheck.check("K", "S", yahoo, as_of, now)
+        self.assertTrue(same)                                  # 没有全市场数据权限 → 改用 IEX
+        self.assertIn("Alpaca（iex）一致", line)
+        self.assertLessEqual(B.bar_requests[0].end, now - dt.timedelta(minutes=15))   # 免费账户只能查 15 分钟以前的
+        B.bars_error = {"sip": ConnectionError("x"), "iex": ConnectionError("network unreachable")}
+        same, line = pricecheck.check("K", "S", yahoo, as_of, now)
+        self.assertIsNone(same)
+        self.assertIn("没做成", line)
+        self.assertIn("不影响交易", line)
+        B.bars_error, B.bars_delay = {}, 0.5
+        old, pricecheck.TIMEOUT = pricecheck.TIMEOUT, 0.05
+        try:
+            same, line = pricecheck.check("K", "S", yahoo, as_of, now)   # Alpaca 卡住：不等
+        finally:
+            pricecheck.TIMEOUT = old
+        self.assertIsNone(same)
+        self.assertIn("没回音", line)
+        B.bars_delay, B.bars = 0.0, {"SPY": {as_of: 500.0}}    # QQQ 没有 Alpaca 日线
+        same, line = pricecheck.check("K", "S", yahoo, as_of, now)
+        self.assertTrue(same)
+        self.assertIn("QQQ 没有 Alpaca 日线", line)
+        B.bars = {}                                            # 一只都没有
+        same, line = pricecheck.check("K", "S", yahoo, as_of, now)
+        self.assertIsNone(same)
+        self.assertIn(f"Alpaca 没有 {as_of} 的日线", line)
+
+
 import aplus                             # noqa: E402
 
 

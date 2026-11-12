@@ -159,6 +159,33 @@ class LiveModeTests(unittest.TestCase):
         self.assertEqual(r["result"], 0)
         self.assertEqual(r["calls"], ["preflight", "rotation"])
 
+    def test_live_job_refuses_to_trade_during_the_trading_day(self):
+        # 1.0.2：白天手动双击 run_live.bat → 不换仓、不算一次尝试，17:10 照常（以前会按盘中价格换仓，17:10 反而跳过）
+        r = scenario("job", flag=True, config=LIVE_ON, now="2026-11-09T11:00:00")     # 星期一上午
+        self.assertEqual(r["result"], 0)
+        self.assertEqual(r["calls"], [])                 # 不跑自检、不换仓
+        self.assertFalse(r["state_file"])                # 也不算一次尝试
+        self.assertEqual(r["paper_flags"], [])           # 没连券商
+        self.assertIn("今天 17:10 会自动运行", r["stdout"])
+        r = scenario("job", flag=True, config=LIVE_ON, now="2026-11-09T17:10:00")
+        self.assertEqual(r["calls"], ["preflight", "rotation"])
+
+    def test_live_waits_for_todays_close_before_trading(self):
+        # 1.0.2：行情还没更新到今天的收盘价 → 前两次不下单、不报警；最后一次（不加 --retry-if-stale）照常换仓并报警
+        base.write_prices("GLD", base.fake_path(base.DRIFT["GLD"])[:-1], base.fake_index()[:-1])   # GLD 少最新一天
+        try:
+            r = scenario("rotation", submit=True, flag=True, config=LIVE_ON, account=EMPTY_10K,
+                         extra_argv=["--retry-if-stale"])
+            self.assertIsNone(r["error"])
+            self.assertEqual(r["result"], "stale")
+            self.assertEqual(r["orders"], [])
+            self.assertEqual(r["alerts"], "")
+            r = scenario("rotation", submit=True, flag=True, config=LIVE_ON, account=EMPTY_10K)
+            self.assertTrue(r["orders"])
+            self.assertIn("【实盘】自动换仓：行情不完整：GLD", r["alerts"])
+        finally:
+            base.make_data()
+
     def test_live_monitor_is_read_only(self):
         r = scenario("monitor", account={"equity": 3000, "cash": 3000})
         self.assertIsNone(r["error"])

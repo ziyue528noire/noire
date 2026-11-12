@@ -82,7 +82,10 @@ if scenario == "rotation":
     import scoreboard
     os.makedirs(scoreboard.SHARED_DIR, exist_ok=True)     # 共享成绩单文件夹存在时，实盘也不能往里写
     paper_rotation.load_keys = keys.load_keys
-    out["result"], out["error"], out["stdout"] = run(paper_rotation.main, ["--live"] if ARGS.get("submit") else [])
+    out["result"], out["error"], out["stdout"] = run(paper_rotation.main, (["--live"] if ARGS.get("submit") else [])
+                                                     + ARGS.get("extra_argv", []))
+    alerts_file = os.path.join(paths.RUNTIME, "alerts.txt")
+    out["alerts"] = open(alerts_file, encoding="utf-8").read() if os.path.exists(alerts_file) else ""
     # 成绩单：直接记两天再生成一次（不依赖今天是不是交易日），检查实盘有没有写进共享成绩单
     import datetime as dt
     with open(scoreboard.PAPER_HISTORY, "w", encoding="utf-8") as f:      # 模拟盘的记录（对照用，只读）
@@ -183,12 +186,16 @@ elif scenario == "monitor":
     monitor.load_keys = keys.load_keys
     out["result"], out["error"], out["stdout"] = run(monitor.main, [])
 elif scenario == "job":
+    import datetime as dt
     keys.load_keys = lambda: ("LIVE_K", "LIVE_S")
     import paper_job
     calls = []
     paper_job.run_preflight = lambda: calls.append("preflight") or True
     paper_job.run_rotation = lambda: calls.append("rotation") or "ok"
-    out["result"], out["error"], out["stdout"] = run(paper_job.main, [])
+    # 默认今天 17:10（自动运行的时间）；以前用“现在”，白天跑测试会被 1.0.2 的盘中保护挡住
+    now = (dt.datetime.fromisoformat(ARGS["now"]) if ARGS.get("now")
+           else dt.datetime.combine(dt.date.today(), dt.time(17, 10)))
+    out["result"], out["error"], out["stdout"] = run(lambda: paper_job.main(now), [])
     out["calls"] = calls
     out["state_file"] = os.path.exists(paper_job.STATE)
 elif scenario == "readonly_submit":

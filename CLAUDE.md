@@ -1,6 +1,6 @@
 # Noire —— 给 Claude Code 的项目说明（每次会话开始自动读取）
 
-Noire（原名 Excaliber）是用户的美股自动交易系统（**模拟盘**每天运行；**实盘模式**已写好、默认关闭，用户计划 11 月小额尝试）：动量轮动策略“**A+ 稳健版**”（2026-10-15 用户选定，`aplus.py`）。
+Noire（原名 Excaliber）是用户的美股自动交易系统（**模拟盘**每天运行；**实盘**（真钱）2026-11-01 起由用户打开，11-02 起每天 17:10 自动运行）：动量轮动策略“**A+ 稳健版**”（2026-10-15 用户选定，`aplus.py`）。
 7 只 ETF（SPY QQQ IWM EFA EEM TLT GLD）；资金分 4 批，各在月末 / 月末前第 5、10、15 个交易日按 1/3/6/12 月收益均值选前 2 名，
 两只按波动倒数分配，分数 ≤0 的份额换成 SHY；杠杆 = 30% ÷ 组合近 63 天波动（1~2 倍），SPY 低于 200 日均线时最多 1 倍；不借钱买 SHY。
 **第二条腿**（`dipbuy.py`，2026-10-16 用户同意启用）：SPY 收盘在 200 日线上方且 2 日 RSI < 10 → 买 SPY，收盘高于 5 日均线 → 卖；
@@ -26,7 +26,7 @@ Noire（原名 Excaliber）是用户的美股自动交易系统（**模拟盘**�
 5. 更新 README.md；重要变化告诉用户，以便更新项目文档 `noire-system.md` 的变更记录。
 
 ## 运行方式（已经自动化，一般不需要手动跑）
-- Windows 计划任务 `Noire Paper Rotation`：周一至五 17:00 / 17:30 / 18:00 → `run_paper.bat` → `paper_job.py`（成功一次后跳过；第 3 次仍失败才报警）。
+- Windows 计划任务 `Noire Paper Rotation`：周一至五 17:00 / 17:30 / 18:00 → `run_paper.bat` → `paper_job.py`（成功一次后跳过；第 3 次或今天最后一次仍失败才报警；行情没更新到今天的收盘价时先等下一次；工作日 16:30 以前不换仓）。
 - Windows 计划任务 `Noire Monitor`：周一至五 9:45–15:45 每小时 → `monitor.py`（只读监控 + 与券商核对）。
 - 实盘（装上以后）：`Noire Live Rotation` 周一至五 17:10 / 17:40 / 18:10 → `run_live.bat`；`Noire Live Monitor` 9:47–15:47 每小时 → `run_live_monitor.bat`。记录全部在 `live\` 子文件夹（警报 `live\alerts.txt`，状态 `live\reports\paper_status.txt`）。
 - Claude 定时任务 “Noire 收盘日报”（17:16）和 “Noire 盘中警报”（9:52–15:52）读本文件夹的日志，推送到用户手机。
@@ -41,8 +41,9 @@ Noire（原名 Excaliber）是用户的美股自动交易系统（**模拟盘**�
 | dipbuy.py | **第二条腿**：RSI(2) 超跌反弹，只用 A+ 剩余额度——改它必须同步 research/research_v3.py 并跑测试 |
 | fills.py / tracking.py | 成交价记录（monitor 每小时写 logs/fills.csv）；实盘 vs 模型对账 → reports/tracking.txt（只读） |
 | rotation.py / backtest.py | 旧的简单回测（rotation.py 的 load_panel 仍被实盘使用） |
-| paper_rotation.py | 每日换仓（返回 ok / stopped / blocked） |
-| paper_job.py | 有限次数重试 + 运行锁 |
+| paper_rotation.py | 每日换仓（返回 ok / stopped / blocked；加 --retry-if-stale 时行情没更新返回 stale） |
+| paper_job.py | 有限次数重试 + 运行锁 + 工作日 16:30 以前不换仓 |
+| pricecheck.py | 换仓前和 Alpaca 日线核对收盘价（只报警，不影响交易） |
 | risk.py / ledger.py / alerts.py / paths.py | STOP、单日亏损、回撤记录；订单台账；报警；运行文件路径（测试用 EXC_RUNTIME_DIR 指向临时目录） |
 | monitor.py / trade.py / emergency.py | 监控核对、手动下单与状态、紧急停止 |
 | scoreboard.py | 成绩单（与 SPY、ChatGPT 系统同期比较） |

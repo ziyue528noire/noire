@@ -3,6 +3,7 @@
 
   python paper_rotation.py          空跑：只打印打算怎么做，不下单
   python paper_rotation.py --live   真正提交订单（“--live”的意思是“提交”，不是实盘）
+  （paper_job.py 在今天后面还有自动运行时会再加 --retry-if-stale：行情还没更新到今天的收盘价就先不换仓，返回 "stale"）
 
 账户：默认是【模拟盘】。实盘（真钱）由环境变量 NOIRE_PROFILE=live 决定（run_live.bat 等实盘脚本才会设），
 实盘还要过 broker.py 的三道闸（LIVE_ENABLED、enable_live.bat、LIVE_MAX_CAPITAL）才会真正下单，
@@ -35,6 +36,7 @@ import cashflow
 import scoreboard
 import aplus
 import dipbuy
+import pricecheck
 from paths import rt, HERE
 from keys import load_keys
 from rotation import load_panel
@@ -162,11 +164,25 @@ def main():
         sys.exit("行情数据异常，为安全起见不操作：" + "；".join(bad_px))
     as_of = closes.index[-1].date()
     data_notes, trading_today = check_data(client, last_bar, as_of, now)
+    if data_notes and "--retry-if-stale" in sys.argv:
+        # 1.0.2：行情还没更新到今天的收盘价 → 这次先不换仓，等今天下一次自动运行（30 分钟后）再试。
+        # 以前第一次就按前一天的价格换了，而且今天算“已经成功”，后面行情更新了也不会再换。
+        # 今天最后一次自动运行（paper_job 不加这个参数）还是没有，才按前一天的价格换仓并报警（和以前一样）。
+        print("行情还没更新好：" + "；".join(n.lstrip("⚠ ") for n in data_notes))
+        return "stale"
+    check_lines = []
+    if not data_notes:      # 行情是最新、完整的 → 和券商 Alpaca 的日线收盘价核对一下（只报警，不影响交易）
+        same, line = pricecheck.check(key, secret, closes.iloc[-1], as_of, now)
+        print(line)
+        if same is False:
+            check_lines.append("⚠ " + line)
+            if live:
+                alerts.add("自动换仓：" + line)
     target, lev, sig_lines = aplus.compute(closes, trading_calendar(client, as_of), max_lev=cap_lev)
     target, dip, dip_lines = dipbuy.compute(closes, target, max_total=cap_lev)   # 第二条腿：只用 A+ 没用完的额度
     live_lines = ([f"实盘设置：最多管理 ${cap_usd:,.0f}，杠杆上限 {cap_lev:.2f} 倍"
                    f"{'，按金额下单（可以买零股）' if frac else ''}"] if runmode.IS_LIVE else [])
-    sig_lines = data_notes + live_lines + sig_lines + dip_lines
+    sig_lines = data_notes + check_lines + live_lines + sig_lines + dip_lines
     if data_notes and live:
         alerts.add("自动换仓：" + "；".join(n.lstrip("⚠ ") for n in data_notes))
     print(f"最新数据：{as_of}　策略：{config.STRATEGY_NAME}")

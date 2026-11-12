@@ -6,6 +6,8 @@
   - 另一次运行还没结束（锁未释放且不到 25 分钟）→ 退出，避免同时跑两份
   - 否则：先跑全部安全自检（tests 文件夹），通过后再运行换仓（换仓程序内部还会核实台账、检查 STOP）
   - 失败：前两次只记日志，等下一次重试；第 3 次仍失败才报警（推送到手机）
+  - 行情还没更新到今天的收盘价：前两次先不换仓，等下一次再试；最后一次还没有，才按前一天的价格换仓并报警（1.0.2）
+  - 工作日 16:30 以前（白天手动双击）：不换仓，也不算一次尝试——当天的收盘价还没出来（1.0.2）
 重试不会造成重复下单：订单编号按“日期+标的+方向”固定，券商会拒绝同编号订单；
 有未成交订单、台账里有结果不明的订单时，换仓程序本身也不会再下单。
 """
@@ -20,12 +22,21 @@ os.chdir(HERE)
 sys.path.insert(0, HERE)
 
 import alerts
+import runmode
 from paths import rt
 
 STATE = rt("logs", "paper_job_state.json")
 LOCK = rt("logs", "paper_job.lock")
 MAX_ATTEMPTS = 3
 LOCK_STALE_MINUTES = 25
+# 1.0.2（2026-11-07）：
+TRADE_AFTER = dt.time(16, 30)  # 工作日这个时间以前不换仓：16:00 收盘，当天的收盘价要过一会儿才出来
+LAST_CALL = dt.time(18, 0)     # 这个时间以后开始的运行 = 今天最后一次自动运行（模拟盘 18:00、实盘 18:10），后面没有重试了
+RETRY_IF_STALE = False         # main() 设置：后面还有自动运行时，行情没更新到今天的收盘价就等下一次（见 run_rotation）
+
+
+class Retry(Exception):
+    """这次先不换仓、等下一次自动运行（不是程序出错）。"""
 
 
 def load_state(today: str) -> dict:
@@ -74,10 +85,10 @@ def run_preflight() -> bool:
 
 
 def run_rotation() -> str:
-    """运行一次换仓。返回 'ok' / 'stopped' / 'blocked'；出错抛异常。"""
+    """运行一次换仓。返回 'ok' / 'stopped' / 'blocked' / 'stale'（行情还没更新，只在 RETRY_IF_STALE 时）；出错抛异常。"""
     import paper_rotation
     old = sys.argv
-    sys.argv = ["paper_rotation.py", "--live"]
+    sys.argv = ["paper_rotation.py", "--live"] + (["--retry-if-stale"] if RETRY_IF_STALE else [])
     try:
         return paper_rotation.main() or "ok"
     except SystemExit as e:          # 例如数据太旧时 sys.exit("...")
@@ -96,12 +107,25 @@ def live_gate():
     return None if ok else why
 
 
+def too_early(now: dt.datetime) -> bool:
+    """工作日（周一到周五）16:30 以前：当天的收盘价还没出来，不换仓（1.0.2）。
+    白天手动双击 run_live.bat / run_paper.bat 会被挡住：不挡的话会按盘中价格换仓，而且今天算“已经成功”，
+    傍晚用收盘价的正式运行反而会跳过。周末可以运行（用的是星期五的收盘价）。"""
+    return now.weekday() < 5 and now.time() < TRADE_AFTER
+
+
 def main(now: dt.datetime = None) -> int:
+    global RETRY_IF_STALE
     now = now or dt.datetime.now()
     why_off = live_gate()
     if why_off:
         print(f"{now:%Y-%m-%d %H:%M} 实盘自动交易没有打开（{why_off}），本次不运行。"
               "只想看看会怎么买卖，可以双击 live_dryrun.bat")
+        return 0
+    if too_early(now):
+        print(f"{now:%Y-%m-%d %H:%M} 工作日 {TRADE_AFTER:%H:%M} 以前不换仓：今天的收盘价还没出来（策略要用收盘价决定买什么）。"
+              f"不用手动运行，今天 {'17:10' if runmode.IS_LIVE else '17:00'} 会自动运行。"
+              + ("只想看看会怎么买卖，可以双击 live_dryrun.bat" if runmode.IS_LIVE else ""))
         return 0
     today = f"{now:%Y-%m-%d}"
     st = load_state(today)
@@ -117,7 +141,9 @@ def main(now: dt.datetime = None) -> int:
     try:
         st["attempts"] += 1
         attempt = st["attempts"]
-        final = attempt >= MAX_ATTEMPTS
+        last_today = now.time() >= LAST_CALL          # 例如电脑 18:10 才醒：这就是今天最后一次自动运行
+        final = attempt >= MAX_ATTEMPTS or last_today
+        RETRY_IF_STALE = not final
         print(f"----- 第 {attempt}/{MAX_ATTEMPTS} 次尝试（{now:%H:%M}）-----")
         try:
             if not run_preflight():
@@ -125,23 +151,35 @@ def main(now: dt.datetime = None) -> int:
             result = run_rotation()
             if result == "blocked":
                 raise RuntimeError("有订单结果无法确认，未交易")
+            if result == "stale":
+                raise Retry("行情还没更新到今天的收盘价")
             st["success"] = True
             st["history"].append({"time": f"{now:%H:%M}", "result": result})
             save_state(st)
             if attempt > 1:
-                print(f"第 {attempt} 次尝试成功（前面 {attempt - 1} 次失败，详见上方日志）")
+                waited = all(h.get("result") == "retry" for h in st["history"][:-1])
+                print(f"第 {attempt} 次尝试成功（前面 {attempt - 1} 次{'在等行情更新' if waited else '失败'}，详见上方日志）")
             return 0
         except Exception as e:
-            err = f"{type(e).__name__}: {str(e)[:200]}"
-            print(traceback.format_exc())
-            st["history"].append({"time": f"{now:%H:%M}", "result": "failed", "error": err})
+            waiting = isinstance(e, Retry)
+            err = str(e)[:200] if waiting else f"{type(e).__name__}: {str(e)[:200]}"
+            if not waiting:
+                print(traceback.format_exc())
+            st["history"].append({"time": f"{now:%H:%M}", "result": "retry" if waiting else "failed", "error": err})
             save_state(st)
-            if final:
+            if final and attempt >= MAX_ATTEMPTS:
                 alerts.add(f"今天的自动换仓 {MAX_ATTEMPTS} 次都失败了（最后一次：{err}），今天没有换仓，请检查")
+            elif final:
+                alerts.add(f"今天的自动换仓失败了（{now:%H:%M} 第 {attempt} 次，今天后面没有自动运行了；错误：{err}），"
+                           "今天没有换仓，请检查")
+            elif waiting:
+                print(f"{err}，这次先不换仓。30 分钟后自动再试（第 {attempt + 1}/{MAX_ATTEMPTS} 次）；"
+                      "今天最后一次自动运行时还没有，就按前一天的收盘价换仓并报警")
             else:
                 print(f"本次失败：{err}。30 分钟后自动重试（第 {attempt + 1}/{MAX_ATTEMPTS} 次）")
             return 1
     finally:
+        RETRY_IF_STALE = False
         release_lock()
 
 

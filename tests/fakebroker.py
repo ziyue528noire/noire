@@ -6,6 +6,7 @@
 """
 import sys
 import enum
+import time
 import types
 import uuid
 import datetime as dt
@@ -67,6 +68,19 @@ class StockLatestTradeRequest(_Req):
     pass
 
 
+class StockBarsRequest(_Req):
+    pass
+
+
+class TimeFrame:
+    Day = "1Day"
+
+
+class DataFeed(enum.Enum):
+    IEX = "iex"
+    SIP = "sip"
+
+
 OPEN_STATES = {"new", "accepted", "pending_new", "partially_filled"}
 
 
@@ -94,6 +108,10 @@ class Broker:
         self.activities = []         # 账户活动（出入金 CSD/CSW），券商原始格式的字典
         self.activities_error = False  # True = 查账户活动时网络出错
         self.activity_calls = []     # 记下查询参数（检查只读查询的写法）
+        self.bars = {}               # Alpaca 日线收盘价 {标的: {日期: 收盘价}}（收盘价核对用；空 = 没有数据）
+        self.bars_error = {}         # {"sip"/"iex": 异常}：用这个数据源查日线时出错（例如没有全市场数据权限）
+        self.bars_delay = 0.0        # 秒：模拟 Alpaca 很慢（测试超时）
+        self.bar_requests = []       # 记下日线查询（检查查询的写法）
 
     # —— 测试辅助 ——
     def add_order(self, symbol, side, qty, status="accepted", client_order_id=None, when=None, notional=None):
@@ -214,6 +232,23 @@ class StockHistoricalDataClient:
     def get_stock_latest_trade(self, req):
         return {req.symbol_or_symbols: NS(price=BROKER.price)}
 
+    def get_stock_bars(self, req):
+        b = BROKER
+        b.bar_requests.append(req)
+        if b.bars_delay:
+            time.sleep(b.bars_delay)
+        feed = getattr(getattr(req, "feed", None), "value", None)
+        if feed in b.bars_error:
+            raise b.bars_error[feed]
+        syms = req.symbol_or_symbols if isinstance(req.symbol_or_symbols, list) else [req.symbol_or_symbols]
+        data = {}
+        for s in syms:     # 真 Alpaca：日线的时间是美东 0 点（这里用 UTC 5 点）；不按 end 过滤，测试不依赖现在几点
+            rows = [NS(timestamp=dt.datetime.combine(d, dt.time(5, 0), tzinfo=dt.timezone.utc), close=c)
+                    for d, c in sorted(b.bars.get(s, {}).items()) if d >= req.start.date()]
+            if rows:
+                data[s] = rows
+        return NS(data=data)
+
 
 def install():
     """把假的 alpaca 模块装进 sys.modules（必须在项目代码导入 alpaca 之前调用）。"""
@@ -226,6 +261,8 @@ def install():
         "alpaca.data": types.ModuleType("alpaca.data"),
         "alpaca.data.historical": types.ModuleType("alpaca.data.historical"),
         "alpaca.data.requests": types.ModuleType("alpaca.data.requests"),
+        "alpaca.data.timeframe": types.ModuleType("alpaca.data.timeframe"),
+        "alpaca.data.enums": types.ModuleType("alpaca.data.enums"),
     }
     mods["alpaca.trading.client"].TradingClient = TradingClient
     for name in ("MarketOrderRequest", "LimitOrderRequest", "GetOrdersRequest", "GetCalendarRequest"):
@@ -234,4 +271,7 @@ def install():
         setattr(mods["alpaca.trading.enums"], name, globals()[name])
     mods["alpaca.data.historical"].StockHistoricalDataClient = StockHistoricalDataClient
     mods["alpaca.data.requests"].StockLatestTradeRequest = StockLatestTradeRequest
+    mods["alpaca.data.requests"].StockBarsRequest = StockBarsRequest
+    mods["alpaca.data.timeframe"].TimeFrame = TimeFrame
+    mods["alpaca.data.enums"].DataFeed = DataFeed
     sys.modules.update(mods)
