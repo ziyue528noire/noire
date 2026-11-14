@@ -308,6 +308,73 @@ class LiveModeTests(unittest.TestCase):
         self.assertEqual({x["assigned_to"] for x in r["ledger"]}, {"start"})
         self.assertNotIn("出入金：", r["scoreboard"])
 
+    # ---------- 1.0.3（2026-11-12）：收盘后存取的钱，第二天的“今日”不再扣两次 ----------
+    @staticmethod
+    def _prev_weekday_off():
+        import datetime as dt
+        d = dt.date.today() - dt.timedelta(days=1)
+        while d.weekday() >= 5:
+            d -= dt.timedelta(days=1)
+        return (d - dt.date.today()).days
+
+    def test_live_day_after_after_hours_deposit_shows_the_real_change(self):
+        # 上一个交易日 17:03 存 $300、当晚记进成绩单；券商今天的“昨日净值”已经含这笔钱（11-12 实际发生的情况）
+        p = self._prev_weekday_off()
+        acct = {"equity": 3290, "cash": 3290, "last_equity": 3300, "regt": 3290, "bp": 3290}
+        r = scenario("flows", flag=True, config=LIVE_ON, account=acct,
+                     history=[[p - 7, 3000.0, None], [p, 3300.0, 300.0]],
+                     activities=[{"type": "CSD", "prev_weekday_after_close": True, "amount": 300, "id": "d"}],
+                     ledger_rows=[{"id": "d", "assigned": "prev_weekday"}], runs=1)
+        self.assertIsNone(r["error"])
+        self.assertIn("今日 -0.30%", r["monitor_stdout"])                 # 以前显示 -9.39%（又扣了一次 $300）
+        self.assertNotIn("今天出入金", r["monitor_stdout"])
+        self.assertIn("今日盈亏：$-10.00（-0.30%）", r["status_txt"])
+        self.assertNotIn("已扣除今天的出入金", r["status_txt"])
+        self.assertNotIn("出入金：今天", r["paper_status"])
+        self.assertEqual(self._today_row(r)["flow"], "0.00")              # 成绩单本来就对，不受影响
+        self.assertEqual(r["alerts"], "")
+
+    def test_live_after_hours_withdrawal_does_not_hide_next_days_loss(self):
+        # 上一个交易日 17:03 取 $300、当晚记进成绩单（净值 $2,700）；今天真跌 8%：必须只卖不买并报警
+        p = self._prev_weekday_off()
+        acct = {"equity": 2484, "cash": 2484, "last_equity": 2700, "regt": 2484, "bp": 2484}
+        r = scenario("flows", flag=True, config=LIVE_ON, account=acct,
+                     history=[[p - 7, 3000.0, None], [p, 2700.0, -300.0]],
+                     activities=[{"type": "CSW", "prev_weekday_after_close": True, "amount": -300, "id": "w"}],
+                     ledger_rows=[{"id": "w", "assigned": "prev_weekday"}], runs=1)
+        self.assertIsNone(r["error"])
+        self.assertIn("今天只允许卖出", r["stdout"])                       # 以前：-8% 被算成 +3.1%，保护失效
+        self.assertIn("今天已亏损", r["alerts"])
+        self.assertFalse(any(o["side"] == "buy" for o in r["orders"]))
+
+    def test_live_money_deposited_after_the_evening_run_counts_from_the_recorded_close(self):
+        # 上一个交易日 20:00 才存 $300（当晚的成绩单已经记完，不含它）；券商今天的“昨日净值”可能已经含它
+        p = self._prev_weekday_off()
+        acct = {"equity": 3290, "cash": 3290, "last_equity": 3300, "regt": 3290, "bp": 3290}
+        r = scenario("flows", flag=True, config=LIVE_ON, account=acct,
+                     history=[[p - 7, 3000.0, None], [p, 3000.0, 0.0]],
+                     activities=[{"type": "CSD", "off": p - 10, "amount": 3000, "id": "s"},   # 起点以前存的（已有记录文件）
+                                 {"type": "CSD", "prev_weekday_evening": True, "amount": 300, "id": "e"}],
+                     ledger_rows=[{"id": "s", "assigned": "start"}], runs=1)
+        self.assertIsNone(r["error"])
+        self.assertIn("今日 -0.33%", r["monitor_stdout"])                 # (3290 − 300) ÷ 3000 − 1；以前 -9.39%
+        self.assertIn("今日盈亏：$-10.00（-0.33%）（已扣除今天的出入金 +$300.00（存钱））", r["status_txt"])
+        self.assertEqual(self._today_row(r)["flow"], "300.00")            # 成绩单：这笔钱记到今天这一行
+
+    def test_live_money_withdrawn_after_the_evening_run_does_not_hide_a_loss(self):
+        # 上一个交易日 20:00 取 $300（成绩单那一行还是 $3,000）；券商的“昨日净值”已经是 $2,700；今天真跌 8%
+        p = self._prev_weekday_off()
+        acct = {"equity": 2484, "cash": 2484, "last_equity": 2700, "regt": 2484, "bp": 2484}
+        r = scenario("flows", flag=True, config=LIVE_ON, account=acct,
+                     history=[[p - 7, 3000.0, None], [p, 3000.0, 0.0]],
+                     activities=[{"type": "CSD", "off": p - 10, "amount": 3000, "id": "s"},
+                                 {"type": "CSW", "prev_weekday_evening": True, "amount": -300, "id": "o"}],
+                     ledger_rows=[{"id": "s", "assigned": "start"}], runs=1)
+        self.assertIsNone(r["error"])
+        self.assertIn("今天只允许卖出", r["stdout"])                       # (2484 + 300) ÷ 3000 − 1 = -7.2%；以前算成 +3.1%
+        self.assertIn("今天已亏损", r["alerts"])
+        self.assertEqual(self._today_row(r)["flow"], "-300.00")
+
     # ---------- 实盘警报抄送到本文件夹的 alerts.txt（手机推送的定时任务只读这个文件）----------
     def test_live_alerts_are_copied_for_phone_push(self):
         mirror = os.path.join(tempfile.mkdtemp(prefix="noire_mirror_"), "alerts.txt")

@@ -108,25 +108,47 @@ elif scenario == "flows":
     day = lambda off: f"{today + dt.timedelta(days=off):%Y-%m-%d}"
     hist = ARGS.get("history", [])
     if hist:
+        with_flow = any(len(h) > 2 for h in hist)       # [偏移天数, 净值, 出入金]：带 flow 列（1.0.3 的场景）
         with open(scoreboard.HISTORY, "w", encoding="utf-8") as f:
-            f.write("date,equity,spy_close,leverage,drawdown,broker_equity\n")
-            for off, eq in hist:
-                f.write(f"{day(off)},{eq:.2f},500.0000,1.000,0.0000,{eq:.2f}\n")
+            f.write("date,equity,spy_close,leverage,drawdown,broker_equity" + (",flow" if with_flow else "") + "\n")
+            for h in hist:
+                off, eq = h[0], h[1]
+                fl = (f",{h[2]:.2f}" if len(h) > 2 and h[2] is not None else ",") if with_flow else ""
+                f.write(f"{day(off)},{eq:.2f},500.0000,1.000,0.0000,{eq:.2f}{fl}\n")
         with open(paper_rotation.STATE_FILE, "w", encoding="utf-8") as f:
             json.dump({"start_date": day(hist[0][0]), "start_equity": hist[0][1], "spy_start": 500.0}, f)
+    def prev_weekday():
+        d = today - dt.timedelta(days=1)
+        while d.weekday() >= 5:
+            d -= dt.timedelta(days=1)
+        return d
+
     def when(a):
-        """(日期, 到账时间 UTC)：默认当天美东 02:20；prev_weekday_noon = 上一个工作日中午（上一个收盘之前）。"""
-        if a.get("prev_weekday_noon"):
-            d = today - dt.timedelta(days=1)
-            while d.weekday() >= 5:
-                d -= dt.timedelta(days=1)
-            t = dt.datetime.combine(d, dt.time(12, 0)).astimezone().astimezone(dt.timezone.utc)
-            return f"{d:%Y-%m-%d}", t.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+        """(日期, 到账时间 UTC)：默认当天美东 02:20；prev_weekday_noon = 上一个工作日中午（上一个收盘之前）；
+        prev_weekday_after_close = 上一个工作日 17:03（收盘以后、17:10 换仓以前，1.0.3）；
+        prev_weekday_evening = 上一个工作日 20:00（当晚的换仓已经记完成绩单以后，1.0.3）。"""
+        for flag, clock in (("prev_weekday_noon", dt.time(12, 0)), ("prev_weekday_after_close", dt.time(17, 3)),
+                            ("prev_weekday_evening", dt.time(20, 0))):
+            if a.get(flag):
+                d = prev_weekday()
+                t = dt.datetime.combine(d, clock).astimezone().astimezone(dt.timezone.utc)
+                return f"{d:%Y-%m-%d}", t.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
         return day(a["off"]), f"{day(a['off'])}T07:20:52.48Z"
     B.activities = [{"id": a.get("id", f"act{i}"), "activity_type": a["type"], "date": when(a)[0],
                      "created_at": when(a)[1], "net_amount": str(a["amount"]),
                      "status": a.get("status", "executed"), "description": "type: instant_ach"}
                     for i, a in enumerate(ARGS.get("activities", []))]
+    if ARGS.get("ledger_rows"):                 # 事先记好的出入金（assigned = "prev_weekday" / "start" / 偏移天数）
+        import cashflow
+        acts = {a["id"]: a for a in B.activities}
+        with open(cashflow.LEDGER, "w", encoding="utf-8") as f:
+            f.write("id,created_at,date,type,amount,assigned_to\n")
+            for x in ARGS["ledger_rows"]:
+                a, asg = acts[x["id"]], x["assigned"]
+                asg = (f"{prev_weekday():%Y-%m-%d}" if asg == "prev_weekday" else
+                       asg if asg == "start" else day(asg))
+                t = cashflow._local(a["created_at"])
+                f.write(f"{a['id']},{t},{a['date']},{a['activity_type']},{float(a['net_amount']):.2f},{asg}\n")
     if ARGS.get("ledger_raw") is not None:
         import cashflow
         with open(cashflow.LEDGER, "w", encoding="utf-8") as f:

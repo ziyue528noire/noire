@@ -45,6 +45,7 @@ os.chdir(HERE)   # 不管从哪里启动，相对路径（data/）都指向本�
 STATE_FILE = rt("paper_state.json")
 TRADE_LOG = rt("logs", "trades.csv")
 TARGETS_LOG = rt("logs", "targets.csv")
+PICKS_FILE = rt("logs", "batch_picks.json")   # 上一次正式运行时每一批拿什么（1.0.3，只用来写说明）
 STATUS_FILE = rt(config.REPORT_DIR, "paper_status.txt")
 DRYRUN_STATUS_FILE = rt(config.REPORT_DIR, "paper_status_dryrun.txt")   # 空跑写这里，不覆盖正式状态
 
@@ -178,7 +179,16 @@ def main():
             check_lines.append("⚠ " + line)
             if live:
                 alerts.add("自动换仓：" + line)
-    target, lev, sig_lines = aplus.compute(closes, trading_calendar(client, as_of), max_lev=cap_lev)
+    cal = trading_calendar(client, as_of)
+    target, lev, sig_lines = aplus.compute(closes, cal, max_lev=cap_lev)
+    try:      # 1.0.3：信号日没变、选股却变了（行情数据修订，比如分红晚到）→ 在四批信号下面写一句说明。只写说明，不影响交易
+        pick_lines = pick_change_lines(aplus.batch_picks(closes, cal, as_of), as_of, save=live)
+    except Exception as e:
+        pick_lines = []
+        print(f"选股变化检查没做成（不影响交易）：{type(e).__name__}: {str(e)[:80]}")
+    if pick_lines:
+        at = max((i for i, l in enumerate(sig_lines) if l.startswith("  第")), default=len(sig_lines) - 1) + 1
+        sig_lines[at:at] = pick_lines
     target, dip, dip_lines = dipbuy.compute(closes, target, max_total=cap_lev)   # 第二条腿：只用 A+ 没用完的额度
     live_lines = ([f"实盘设置：最多管理 ${cap_usd:,.0f}，杠杆上限 {cap_lev:.2f} 倍"
                    f"{'，按金额下单（可以买零股）' if frac else ''}"] if runmode.IS_LIVE else [])
@@ -207,15 +217,16 @@ def main():
         print(f"手动持仓（策略不管）：${manual_value:,.0f}")
 
     # 实盘的出入金（存钱/取钱）：只读查券商记录，收益和风控都不把它当成赚亏（2026-11-05）。出任何错都不影响交易
-    flows, flow_start, day_flow, flow_broken = None, None, 0.0, False
+    flows, flow_start, day_flow, day_start, flow_broken = None, None, 0.0, None, False
     if runmode.IS_LIVE:
         try:
             flows = cashflow.Flows(client)
             flow_start = cashflow.first_day()
-            if flows.ok:          # “今天”= 券商昨日净值（上一个交易日收盘）之后到账的钱
-                day_flow = flows.since(cashflow.prev_close(client, now))
+            if flows.ok:          # “今天”的起点和要扣的钱（1.0.3：收盘后存取的钱不再扣两次，见 cashflow.day_basis）
+                day_start, day_flow = cashflow.day_basis(flows, client, float(acct.last_equity or 0), now, flow_start)
         except Exception as e:    # 例如记录文件被手改坏了
-            flows, day_flow, flow_broken = cashflow.Flows.unknown(f"{type(e).__name__}: {str(e)[:120]}"), 0.0, True
+            flows, day_flow, day_start, flow_broken = (cashflow.Flows.unknown(f"{type(e).__name__}: {str(e)[:120]}"),
+                                                       0.0, None, True)
         if not flows.ok:
             sig_lines.append(f"⚠ 没查到出入金记录（{flows.error}）；今天先不记成绩单，下一次运行连同今天一起补上")
         elif day_flow:
@@ -225,7 +236,7 @@ def main():
 
     # 风控：单日亏损过大当天不买（杠杆已由 aplus 的波动目标 + 趋势开关决定，上限 2 倍）
     # 取钱不会被当成亏损；存钱照旧按券商原始数字（见 risk.daily_loss_guard）
-    day_chg = risk.daily_loss_guard(equity, float(acct.last_equity or 0), day_flow)
+    day_chg = risk.daily_loss_guard(equity, float(acct.last_equity or 0), day_flow, base=day_start)
     no_buy = day_chg < -config.DAILY_LOSS_LIMIT
     if no_buy:
         print(f"风控：今天亏损 {day_chg:.1%}，超过 {config.DAILY_LOSS_LIMIT:.0%} 上限，今天只允许卖出")
@@ -434,6 +445,38 @@ def record_score(day, equity, spy_close, leverage, drawdown, broker_equity=None,
         scoreboard.main()
     except Exception as e:
         print(f"成绩单记录失败（不影响交易）：{e}")
+
+
+def pick_change_lines(picks: dict, as_of, save: bool = True) -> list:
+    """和上一个交易日的正式运行比：信号日没变、选的标的却变了的批次，各写一句说明（1.0.3）。
+    为什么会这样：程序每天用新下载的行情重算每一批；Yahoo 偶尔晚几天才把分红算进价格（11-12 TLT 就是这样），
+    两只分数很接近时排名就可能变。按规则照常调整，这句话只是让人一眼看懂“今天不是换仓日为什么也下了单”。
+    同一天重试几次，比的都是上一个交易日的结果（说明不会只出现在第一次）。
+    save=False（空跑）只比较不保存。文件读不了就当第一次，不影响交易。"""
+    day = f"{as_of:%Y-%m-%d}" if hasattr(as_of, "strftime") else str(as_of)[:10]
+    try:
+        with open(PICKS_FILE, encoding="utf-8") as f:
+            saved = json.load(f)
+        if not isinstance(saved, dict):
+            saved = {}
+    except (OSError, ValueError):
+        saved = {}
+    old = saved.get("base") if saved.get("as_of") == day else saved.get("picks")
+    old = old if isinstance(old, dict) else {}
+    lines = []
+    for k, (sig_day, syms) in sorted(picks.items()):
+        prev = old.get(k)
+        if isinstance(prev, list) and len(prev) == 2 and prev[0] == sig_day and sorted(prev[1]) != sorted(syms):
+            lines.append(f"  ↳ 第{k}批（信号 {sig_day}）的选股变了：{'、'.join(sorted(prev[1])) or '无'} → "
+                         f"{'、'.join(sorted(syms)) or '无'}。信号日没变，是行情数据修订（比如分红晚几天才算进价格）"
+                         f"让排名变了，按规则照常调整，不是出错")
+    if save:
+        os.makedirs(os.path.dirname(PICKS_FILE), exist_ok=True)
+        tmp = PICKS_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"as_of": day, "picks": picks, "base": old}, f, ensure_ascii=False)
+        os.replace(tmp, PICKS_FILE)
+    return lines
 
 
 def log_targets(as_of, lev, target, dip=0.0):

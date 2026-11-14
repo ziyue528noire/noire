@@ -87,11 +87,12 @@ def status(client, keys, out=None):
     from alpaca.trading.enums import QueryOrderStatus
     clock = client.get_clock()
     acct = client.get_account()
+    day_start, day_flow = today_basis(client, acct)
     lines = [f"===== {runmode.LABEL}状态 {dt.datetime.now():%Y-%m-%d %H:%M} =====",
              f"美股现在：{'开盘中' if clock.is_open else '休市'}　"
              f"下次开盘 {clock.next_open:%m-%d %H:%M}　下次收盘 {clock.next_close:%m-%d %H:%M}（美东时间）",
              f"账户净值：${float(acct.equity):,.2f}　现金：${float(acct.cash):,.2f}",
-             f"今日盈亏：{day_pnl_text(acct, today_flow(client))}{'' if clock.is_open else '（券商口径：收盘后会随盘后价格变动；成绩单用收盘净值）'}",
+             f"今日盈亏：{day_pnl_text(acct, day_flow, day_start)}{'' if clock.is_open else '（券商口径：收盘后会随盘后价格变动；成绩单用收盘净值）'}",
              "", "持仓："]
     pos = client.get_all_positions()
     for p in pos:
@@ -214,28 +215,32 @@ def place(client, keys):
     finish(out)
 
 
-def day_pnl_text(acct, day_flow: float = 0.0) -> str:
-    """今日盈亏（券商口径）。day_flow = 今天存取的钱（实盘），扣除后才是真正赚亏的（2026-11-05）。"""
+def day_pnl_text(acct, day_flow: float = 0.0, start: float = None) -> str:
+    """今日盈亏（券商口径）。day_flow = 今天存取的钱（实盘），扣除后才是真正赚亏的（2026-11-05）。
+    start = 今天的起点净值（实盘有出入金时 = 成绩单上一个交易日的收盘净值，见 cashflow.day_basis）；不给 = 券商昨日净值。"""
     import risk
     eq, last = float(acct.equity), float(acct.last_equity or 0)
-    base = risk.day_base(eq, last)
-    note = "" if last > 0 else "（券商没有昨日净值，按今天首次记录的净值算）"
+    base = start if start and start > 0 else risk.day_base(eq, last)
+    note = "" if (last > 0 or (start and start > 0)) else "（券商没有昨日净值，按今天首次记录的净值算）"
     if day_flow:
         import cashflow
         note += f"（已扣除今天的出入金 {cashflow.describe(day_flow)}）"
     return f"${eq - day_flow - base:+,.2f}（{(eq - day_flow) / base - 1:+.2%}）{note}" if base else "无数据"
 
 
-def today_flow(client) -> float:
-    """实盘今天存取的钱（只读查券商记录）；模拟盘或查不到时返回 0。"""
+def today_basis(client, acct):
+    """实盘“今日盈亏”的 (起点净值, 今天要扣的出入金)，见 cashflow.day_basis（1.0.3）。
+    模拟盘或查不到时 = (None, 0)：起点用券商昨日净值，和以前一样。"""
     if not runmode.IS_LIVE:
-        return 0.0
+        return None, 0.0
     try:
         import cashflow
         fl = cashflow.Flows(client)
-        return fl.since(cashflow.prev_close(client)) if fl.ok else 0.0
+        if not fl.ok:
+            return None, 0.0
+        return cashflow.day_basis(fl, client, float(acct.last_equity or 0), None, cashflow.first_day())
     except Exception:
-        return 0.0
+        return None, 0.0
 
 
 def log_trade(sym, side, qty, price, why):

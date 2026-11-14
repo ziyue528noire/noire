@@ -137,21 +137,23 @@ def daily_loss(equity: float, last_equity: float) -> float:
     return equity / base - 1 if base else 0.0
 
 
-def day_change(equity: float, last_equity: float, day_flow: float = 0.0) -> float:
-    """今天的涨跌幅，扣除今天存取的钱（显示用：今日盈亏）。没有出入金时和 daily_loss 一样。"""
-    if not day_flow:
+def day_change(equity: float, last_equity: float, day_flow: float = 0.0, base: float = None) -> float:
+    """今天的涨跌幅，扣除今天存取的钱（显示用：今日盈亏）。没有出入金时和 daily_loss 一样。
+    base = 今天的起点净值（实盘有出入金时由 cashflow.day_basis 给出：上一个交易日的收盘净值）；不给 = 券商昨日净值。"""
+    if not day_flow and not base:
         return daily_loss(equity, last_equity)
-    base = day_base(equity, last_equity)
-    return (equity - day_flow) / base - 1 if base else 0.0
+    start = base if base and base > 0 else day_base(equity, last_equity)
+    return (equity - day_flow) / start - 1 if start else 0.0
 
 
-def daily_loss_guard(equity: float, last_equity: float, day_flow: float = 0.0) -> float:
+def daily_loss_guard(equity: float, last_equity: float, day_flow: float = 0.0, base: float = None) -> float:
     """风控用的单日涨跌（单日亏损超过 5% 只卖不买、盘中报警）。只往“少误报”的方向扣出入金：
-    取钱不会被当成亏损；存钱照旧按券商原始数字算——万一入金记录有误，也绝不会因此误锁成只卖不买。"""
+    取钱不会被当成亏损；存钱照旧按券商原始数字算——万一入金记录有误，也绝不会因此误锁成只卖不买。
+    base：见 day_change（1.0.3：收盘后存取的钱不再扣两次）。"""
     raw = daily_loss(equity, last_equity)
-    if not day_flow:
+    if not day_flow and not base:
         return raw
-    return max(raw, day_change(equity, last_equity, day_flow))
+    return max(raw, day_change(equity, last_equity, day_flow, base))
 
 
 def margin_distance(equity: float, gross: float, maintenance: float = None) -> float:

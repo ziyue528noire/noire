@@ -107,6 +107,21 @@ def base_weights(closes: pd.DataFrame, trading_days, as_of=None):
     return total / len(config.TRANCHE_OFFSETS), notes
 
 
+def batch_picks(closes: pd.DataFrame, trading_days, as_of=None) -> dict:
+    """每一批现在拿什么：{"1": ["2026-10-30", ["EFA", "SPY"]], …}（批号 → [信号日, 标的]，和 base_weights 同一套算法）。
+    只用来在日志里说明“信号日没变、选股却变了”（1.0.3），不参与交易。"""
+    as_of = closes.index[-1] if as_of is None else as_of
+    dates = latest_signal_dates(trading_days, as_of)
+    out = {}
+    for i, k in enumerate(config.TRANCHE_OFFSETS, 1):
+        d = dates.get(k)
+        if d is None:
+            continue
+        w, _ = tranche_weights(closes, d)
+        out[str(i)] = [f"{_as_date(d):%Y-%m-%d}", sorted(str(s) for s, x in w.items() if x > 1e-9)]
+    return out
+
+
 def leverage(closes: pd.DataFrame, base: pd.Series, max_lev=None):
     """杠杆 = 波动目标 ÷ 组合近 63 天年化波动（1~LEVERAGE 倍）；SPY 在 200 日线下方时最多 1 倍。
     max_lev：实盘另设的杠杆上限（不超过 LEVERAGE、不低于 LEV_FLOOR）；None = 模拟盘，和以前一样。

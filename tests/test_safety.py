@@ -871,6 +871,99 @@ class CashFlowTests(unittest.TestCase):
         finally:
             fakebroker.TradingClient.get_calendar = orig
 
+    # ---------- 1.0.3（2026-11-12）：收盘后存取的钱，第二天的“今日”不再扣两次 ----------
+    def _ledger(self, *rows):
+        with open(cashflow.LEDGER, "w", encoding="utf-8") as f:
+            f.write("id,created_at,date,type,amount,assigned_to\n")
+            for r in rows:
+                f.write(",".join(r) + "\n")
+
+    @staticmethod
+    def _act(aid, kind, utc, amount):
+        return {"id": aid, "activity_type": kind, "date": utc[:10], "created_at": utc, "net_amount": str(amount),
+                "status": "executed"}
+
+    def test_after_hours_deposit_is_not_subtracted_again_next_day(self):
+        # 11-12 实际发生：11-11 17:03 存 $200，17:10 记进 11-11 那一行；券商 11-12 的“昨日净值”$1,213.41 已经含这 $200
+        self._history([("2026-11-10", 1000.79, 0.0), ("2026-11-11", 1213.41, 200.0)])
+        self._ledger(("d1", "2026-11-11 17:03", "2026-11-11", "CSD", "200.00", "2026-11-11"))
+        B.activities = [self._act("d1", "CSD", "2026-11-11T22:03:46Z", 200)]
+        client = fakebroker.TradingClient("k", "s")
+        fl = cashflow.Flows(client, enabled=True)
+        now = dt.datetime(2026, 11, 12, 15, 47)
+        self.assertEqual(fl.since(cashflow.prev_close(client, now)), 200.0)     # 以前的算法：当成“今天的”又扣一次
+        start, flow = cashflow.day_basis(fl, client, 1213.41, now, "2026-11-02")
+        self.assertEqual((start, flow), (1213.41, 0.0))
+        self.assertAlmostEqual(risk.day_change(1209.19, 1213.41, flow, start), 1209.19 / 1213.41 - 1)  # -0.35%
+        self.assertAlmostEqual(risk.day_change(1209.19, 1213.41, 200.0), (1209.19 - 200) / 1213.41 - 1)  # 以前 -16.8%
+        self.assertAlmostEqual(risk.daily_loss_guard(1209.19, 1213.41, flow, base=start), 1209.19 / 1213.41 - 1)
+
+    def test_deposit_after_the_evening_run_counts_from_the_recorded_close(self):
+        # 11-11 20:00 才存（17:10 已经记完 11-11 那一行）：成绩单那一行没有这笔钱，今天扣它；券商昨日净值可能已经含它
+        self._history([("2026-11-10", 1000.0, 0.0), ("2026-11-11", 1010.0, 0.0)])
+        self._ledger(("old", "2026-10-21 15:29", "2026-10-21", "CSD", "300.00", "start"))
+        B.activities = [self._act("old", "CSD", "2026-10-21T19:29:50Z", 300),
+                        self._act("d2", "CSD", "2026-11-12T01:00:00Z", 200)]
+        client = fakebroker.TradingClient("k", "s")
+        fl = cashflow.Flows(client, enabled=True)
+        start, flow = cashflow.day_basis(fl, client, 1210.0, dt.datetime(2026, 11, 12, 10, 0), "2026-11-02")
+        self.assertEqual((start, flow), (1010.0, 200.0))
+        self.assertAlmostEqual(risk.day_change(1015.0 + 200, 1210.0, flow, start), 1015.0 / 1010.0 - 1)
+        # 晚上 17:10 记完今天这一行以后（这笔钱记到 11-12），状态页的“今日”还是同一个算法
+        self._history([("2026-11-10", 1000.0, 0.0), ("2026-11-11", 1010.0, 0.0), ("2026-11-12", 1215.0, 200.0)])
+        self._ledger(("old", "2026-10-21 15:29", "2026-10-21", "CSD", "300.00", "start"),
+                     ("d2", "2026-11-11 20:00", "2026-11-12", "CSD", "200.00", "2026-11-12"))
+        fl = cashflow.Flows(client, enabled=True)
+        self.assertEqual(cashflow.day_basis(fl, client, 1210.0, dt.datetime(2026, 11, 12, 17, 15), "2026-11-02"),
+                         (1010.0, 200.0))
+
+    def test_after_hours_withdrawal_does_not_hide_next_days_loss(self):
+        # 11-11 17:03 取 $500，17:10 记进 11-11 那一行（净值 $700）；11-12 真跌 8%：单日亏损保护必须起作用
+        self._history([("2026-11-10", 1200.0, 0.0), ("2026-11-11", 700.0, -500.0)])
+        self._ledger(("w1", "2026-11-11 17:03", "2026-11-11", "CSW", "-500.00", "2026-11-11"))
+        B.activities = [self._act("w1", "CSW", "2026-11-11T22:03:00Z", -500)]
+        client = fakebroker.TradingClient("k", "s")
+        fl = cashflow.Flows(client, enabled=True)
+        now = dt.datetime(2026, 11, 12, 11, 0)
+        start, flow = cashflow.day_basis(fl, client, 700.0, now, "2026-11-02")
+        self.assertEqual((start, flow), (700.0, 0.0))
+        self.assertLess(risk.daily_loss_guard(644.0, 700.0, flow, base=start), -config.DAILY_LOSS_LIMIT)
+        old = fl.since(cashflow.prev_close(client, now))
+        self.assertGreater(risk.daily_loss_guard(644.0, 700.0, old), 0.5)      # 以前：-8% 被算成 +63%，保护失效
+
+    def test_day_basis_without_flows_is_exactly_the_old_numbers(self):
+        self._history([("2026-11-10", 1000.0, 0.0), ("2026-11-11", 1230.0, 0.0)])
+        self._ledger(("old", "2026-10-21 15:29", "2026-10-21", "CSD", "300.00", "start"))
+        B.activities = [self._act("old", "CSD", "2026-10-21T19:29:50Z", 300)]
+        client = fakebroker.TradingClient("k", "s")
+        fl = cashflow.Flows(client, enabled=True)
+        # 没有出入金：起点照旧用券商昨日净值（哪怕和成绩单那一行差几分钱）
+        self.assertEqual(cashflow.day_basis(fl, client, 1234.56, dt.datetime(2026, 11, 12, 10, 0), "2026-11-02"),
+                         (1234.56, 0.0))
+        self.assertEqual(risk.daily_loss_guard(1200.0, 1234.56, 0.0, base=1234.56), risk.daily_loss(1200.0, 1234.56))
+        self.assertEqual(risk.day_change(1200.0, 1234.56, 0.0, 1234.56), risk.daily_loss(1200.0, 1234.56))
+        self.assertEqual(cashflow.day_basis(cashflow.Flows.unknown("x"), client, 1234.56), (1234.56, 0.0))
+
+    def test_day_basis_falls_back_to_the_old_rule_when_records_are_missing(self):
+        client = fakebroker.TradingClient("k", "s")
+        now = dt.datetime(2026, 11, 12, 10, 0)
+        B.activities = [self._act("e1", "CSD", "2026-11-05T07:20:52Z", 300),
+                        self._act("d1", "CSD", "2026-11-11T22:03:46Z", 200)]
+        # 记录文件不见了：不知道哪些钱已经算进成绩单（不能把 11-05 的钱也当成今天的）
+        self._history([("2026-11-02", 700.0, None), ("2026-11-10", 1000.0, 0.0), ("2026-11-11", 1213.0, 200.0)])
+        self.assertEqual(cashflow.day_basis(cashflow.Flows(client, enabled=True), client, 1213.0, now, "2026-11-02"),
+                         (1213.0, 200.0))
+        # 上一个交易日那一行没记（电脑那天没开）
+        self._history([("2026-11-02", 700.0, None), ("2026-11-09", 1000.0, 0.0)])
+        self._ledger(("e1", "2026-11-05 02:20", "2026-11-05", "CSD", "300.00", "2026-11-05"))
+        self.assertEqual(cashflow.day_basis(cashflow.Flows(client, enabled=True), client, 1213.0, now, "2026-11-02"),
+                         (1213.0, 200.0))
+        # 记录文件被改坏：不出错，退回以前的算法
+        with open(cashflow.LEDGER, "w", encoding="utf-8") as f:
+            f.write("id,created_at,date,type,amount,assigned_to\n\"unclosed,quote\n" + "x" * 200000)
+        self.assertEqual(cashflow.day_basis(cashflow.Flows(client, enabled=True), client, 1213.0, now, "2026-11-02"),
+                         (1213.0, 200.0))
+
     def test_flow_lookup_failure_and_paper_mode(self):
         client = fakebroker.TradingClient("k", "s")
         B.activities_error = True
@@ -896,6 +989,100 @@ class CashFlowTests(unittest.TestCase):
             paper_rotation.check_data = orig
         self.assertEqual(B.activity_calls, [])
         self.assertEqual(scoreboard.read(scoreboard.HISTORY)[-1]["flow"], "")
+
+
+class PickChangeTests(unittest.TestCase):
+    """1.0.3：信号日没变、选股却变了（行情数据修订，比如分红晚到）时，在四批信号下面写一句说明。只写说明，不影响交易。"""
+
+    def setUp(self):
+        shutil.rmtree(paths.RUNTIME, ignore_errors=True)
+        os.makedirs(paths.RUNTIME)
+        B.reset()
+        self._orig = (paper_rotation.check_data, paper_rotation.aplus.batch_picks)
+        paper_rotation.check_data = lambda *a, **k: ([], True)      # 固定成“行情最新、今天是交易日”
+
+    def tearDown(self):
+        paper_rotation.check_data, paper_rotation.aplus.batch_picks = self._orig
+
+    def _save(self, obj):
+        os.makedirs(os.path.dirname(paper_rotation.PICKS_FILE), exist_ok=True)
+        with open(paper_rotation.PICKS_FILE, "w", encoding="utf-8") as f:
+            json.dump(obj, f)
+
+    def _saved(self):
+        with open(paper_rotation.PICKS_FILE, encoding="utf-8") as f:
+            return json.load(f)
+
+    def test_batch_picks_match_the_four_batch_notes(self):
+        aplus = paper_rotation.aplus
+        closes = paper_rotation.load_panel(config.ROTATION_UNIVERSE + [config.CASH_SYMBOL])[1]
+        as_of = closes.index[-1].date()
+        cal = paper_rotation.trading_calendar(fakebroker.TradingClient("k", "s"), as_of)
+        picks = aplus.batch_picks(closes, cal, as_of)
+        _, notes = aplus.base_weights(closes, cal, as_of)
+        self.assertEqual(len(picks), len(notes))
+        for k, (day, syms) in picks.items():
+            note = notes[int(k) - 1]
+            self.assertIn(f"第{k}批", note)
+            self.assertIn(f"信号 {day}", note)
+            self.assertTrue(syms)
+            for sym in syms:
+                self.assertIn(sym, note)
+
+    def test_note_only_when_the_signal_day_is_unchanged(self):
+        f = paper_rotation.pick_change_lines
+        p1 = {"3": ["2026-10-16", ["QQQ", "SPY"]], "4": ["2026-11-06", ["EFA", "SPY"]]}
+        self.assertEqual(f(p1, dt.date(2026, 11, 11)), [])                       # 第一次：没有可比的
+        p2 = {"3": ["2026-10-16", ["QQQ", "SPY"]], "4": ["2026-11-06", ["EFA", "TLT"]]}
+        lines = f(p2, dt.date(2026, 11, 12), save=False)                         # 空跑：只比较，不保存
+        self.assertEqual(len(lines), 1)
+        self.assertIn("第4批（信号 2026-11-06）的选股变了：EFA、SPY → EFA、TLT", lines[0])
+        self.assertEqual(self._saved()["as_of"], "2026-11-11")
+        self.assertEqual(f(p2, dt.date(2026, 11, 12)), lines)                     # 正式运行
+        self.assertEqual(f(p2, dt.date(2026, 11, 12)), lines)                     # 同一天重试：说明还在
+        self.assertEqual(self._saved()["as_of"], "2026-11-12")                    # 记的是行情日期，不是信号日
+        self.assertEqual(f(p2, dt.date(2026, 11, 13)), [])                        # 第二天：不再重复
+        p3 = {"3": ["2026-11-13", ["EFA", "QQQ"]], "4": ["2026-11-06", ["EFA", "TLT"]]}
+        self.assertEqual(f(p3, dt.date(2026, 11, 13)), [])                        # 换仓日（信号日变了）：正常，不写
+        with open(paper_rotation.PICKS_FILE, "w", encoding="utf-8") as fh:
+            fh.write("{坏了")
+        self.assertEqual(f(p3, dt.date(2026, 11, 16)), [])                        # 文件坏了：当第一次
+        self.assertEqual(self._saved()["picks"], p3)
+
+    def test_rotation_puts_the_note_under_the_batches_and_dry_run_keeps_the_file(self):
+        self._save({"as_of": "2000-01-03", "picks": {"4": ["2026-11-06", ["EFA", "SPY"]]}})
+        paper_rotation.aplus.batch_picks = lambda *a, **k: {"4": ["2026-11-06", ["EFA", "TLT"]]}
+        dry = run(paper_rotation.main)
+        self.assertIn("第4批（信号 2026-11-06）的选股变了：EFA、SPY → EFA、TLT", dry)
+        self.assertEqual(self._saved()["as_of"], "2000-01-03")                    # 空跑不保存
+        run(paper_rotation.main, "--live")
+        with open(paper_rotation.STATUS_FILE, encoding="utf-8") as fh:
+            status = fh.read().splitlines()
+        i = next(i for i, l in enumerate(status) if "↳ 第4批" in l)
+        self.assertTrue(status[i - 1].startswith("  第4批"))                      # 紧跟在四批信号下面
+        saved = self._saved()
+        self.assertEqual(saved["picks"], {"4": ["2026-11-06", ["EFA", "TLT"]]})
+        self.assertEqual(saved["base"], {"4": ["2026-11-06", ["EFA", "SPY"]]})
+        self.assertNotEqual(saved["as_of"], "2026-11-06")
+        self.assertTrue(B.orders)                                                 # 交易照常
+
+    def test_note_errors_never_stop_trading(self):
+        class Boom(Exception):
+            pass
+
+        def boom(*a, **k):
+            raise Boom("算不出来")
+        paper_rotation.aplus.batch_picks = boom                                  # 任何错误都只打印一行
+        out = run(paper_rotation.main, "--live")
+        self.assertIn("选股变化检查没做成（不影响交易）：Boom", out)
+        self.assertTrue(B.orders)
+
+    def test_note_file_that_cannot_be_written_never_stops_trading(self):
+        os.makedirs(paper_rotation.PICKS_FILE + ".tmp")                         # 写不进去（比如文件被别的程序占着）
+        out = run(paper_rotation.main, "--live")
+        self.assertIn("选股变化检查没做成（不影响交易）", out)
+        self.assertTrue(B.orders)
+        self.assertFalse(os.path.exists(paper_rotation.PICKS_FILE))
 
 
 def synthetic(rets, n=400, start="2024-01-01"):

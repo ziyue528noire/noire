@@ -10,7 +10,8 @@ r"""出入金（往真钱账户存钱 / 取钱）：让收益率、回撤和单�
     净值本身照旧记账户里真实的钱，和券商对得上。
   - 一笔钱记到哪一天：17:10 换仓时第一次看到的新入金/出金，记到当天那一行。如果中间有几天没记成绩单
     （电脑没开、查询失败等），这几天记进记录文件的钱会一起算进下一次记的那一行。
-  - “今日涨跌”（监控、状态页、单日亏损风控）用的是券商“昨日净值”之后到账的钱：按到账时间算，和记录文件无关。
+  - “今日涨跌”（监控、状态页、单日亏损风控）：有出入金的时候，起点用成绩单里上一个交易日的收盘净值，只扣还没记进
+    那一行的钱（1.0.3，见 day_basis）；没有出入金的日子和以前一样，起点 = 券商“昨日净值”。
   - 模拟盘没有出入金：不查询，flow 列留空，所有结果和以前完全一样。
 查询失败（网络等）不影响交易：当天不记成绩单、状态页写提醒，下一次运行连同这一天一起补上。
 """
@@ -143,6 +144,52 @@ def prev_close(client, now=None):
         while day.weekday() >= 5:
             day -= dt.timedelta(days=1)
     return dt.datetime.combine(day, dt.time(16, 0)).astimezone()
+
+
+def _history_row(day):
+    """equity_history.csv 里 day（'YYYY-MM-DD'）那一行；没有或读不了时返回 None。"""
+    try:
+        with open(HISTORY, encoding="utf-8-sig", errors="replace") as f:
+            for r in csv.DictReader(f):
+                if _day(r.get("date")) == day and r.get("equity"):
+                    return r
+    except OSError:
+        pass
+    return None
+
+
+def day_basis(flows, client, last_equity, now=None, start=None):
+    """“今日涨跌”的起点净值和要扣除的出入金：返回 (起点, 出入金)。换仓时的单日风控、盘中监控、状态页共用（1.0.3）。
+
+    以前：起点 = 券商“昨日净值”（last_equity），扣除上一个交易日 16:00 以后到账的钱。
+    问题（2026-11-12 发现）：券商的“昨日净值”不是 16:00 的快照，收盘后到账的钱也算在里面——11-11 17:03 存的 $200
+    已经在 11-12 的昨日净值 $1,213.41 里，又按“16:00 以后到账”扣了一次，11-12 全天显示“今日 -16.8%”（实际 -0.34%）。
+    如果是收盘后取钱，第二天反过来会多加回这笔钱，把真实的亏损藏起来，单日亏损 5% 的保护就可能不起作用。
+    券商几点拍这张快照没有文档，所以不去猜。
+    现在：有出入金的时候，起点改用成绩单里上一个交易日的收盘净值（equity_history.csv 那一行，记到那天及以前的钱
+    都已经在里面），只扣还没记进那一行的钱（记在它之后的 + 还没进记录文件的，见 Flows.unrecorded）。
+    这样“今日”和成绩单今天这一行的算法完全一样。
+    没有出入金的日子：和以前完全一样（起点 = 券商昨日净值，扣 0）。
+    查不到出入金：(券商昨日净值, 0)，和以前一样。
+    成绩单里没有上一个交易日那一行（那天电脑没开、第一天）或者还没有记录文件：退回以前的算法。"""
+    if flows is None or not flows.ok:
+        return last_equity, 0.0
+    cut = prev_close(client, now)
+    old = flows.since(cut)                  # 以前的算法：上一个交易日 16:00 以后到账的钱
+    prev_day = f"{cut:%Y-%m-%d}"
+    try:
+        if read_ledger() is None:           # 还没有记录文件（第一次用，或者被删了）：不知道哪些钱已经算进成绩单
+            return last_equity, old
+        unrec = flows.unrecorded(start, prev_day)
+        if abs(old) < 0.005 and abs(unrec) < 0.005:
+            return last_equity, 0.0         # 没有出入金：和以前完全一样
+        row = _history_row(prev_day)
+        base = float(row["equity"]) if row else 0.0
+    except Exception:                       # 记录文件读不了（比如被手改坏）：退回以前的算法，交易和风控照旧
+        return last_equity, old
+    if base > 0:
+        return base, unrec
+    return last_equity, old                 # 成绩单里没有上一个交易日那一行：退回以前的算法
 
 
 # ---------- 券商记录 ----------

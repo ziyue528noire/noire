@@ -41,7 +41,8 @@ Noire（原名 Excaliber）是用户的美股自动交易系统（**模拟盘**�
 | dipbuy.py | **第二条腿**：RSI(2) 超跌反弹，只用 A+ 剩余额度——改它必须同步 research/research_v3.py 并跑测试 |
 | fills.py / tracking.py | 成交价记录（monitor 每小时写 logs/fills.csv）；实盘 vs 模型对账 → reports/tracking.txt（只读） |
 | rotation.py / backtest.py | 旧的简单回测（rotation.py 的 load_panel 仍被实盘使用） |
-| paper_rotation.py | 每日换仓（返回 ok / stopped / blocked；加 --retry-if-stale 时行情没更新返回 stale） |
+| paper_rotation.py | 每日换仓（返回 ok / stopped / blocked；加 --retry-if-stale 时行情没更新返回 stale）；logs/batch_picks.json 记每批选股，信号日没变、选股变了时写一句说明 |
+| cashflow.py | 实盘出入金：只读查券商入金/出金，记 live/cash_flows.csv；成绩单、回撤、“今日”都扣除（“今日”的起点见 day_basis） |
 | paper_job.py | 有限次数重试 + 运行锁 + 工作日 16:30 以前不换仓 |
 | pricecheck.py | 换仓前和 Alpaca 日线核对收盘价（只报警，不影响交易） |
 | risk.py / ledger.py / alerts.py / paths.py | STOP、单日亏损、回撤记录；订单台账；报警；运行文件路径（测试用 EXC_RUNTIME_DIR 指向临时目录） |
