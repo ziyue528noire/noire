@@ -34,6 +34,10 @@ import dipbuy                            # noqa: E402
 UNI = list(config.ROTATION_UNIVERSE)
 COLS = UNI + [config.CASH_SYMBOL]
 N = 700
+# 1.1（2026-11-14）：实盘名单里的黄金从 GLD 换成了 GLDM，研究引擎自己的名单（research_v2.U0）仍然是 GLD ——
+# 回测要从 2000 年算起，GLDM 2018-06-26 才上市，更早只能用 GLD 的历史，所以 research\ 里的代码不改。
+# 这里登记“实盘代码 → 研究里的代码”；除了登记过的，两边名单必须一模一样（见 research_names）。
+RESEARCH_NAME = {"GLDM": "GLD"}
 
 
 def fake_closes(n=N):
@@ -165,6 +169,14 @@ class ResearchNoPeek(unittest.TestCase):
         self.c = fake_closes()
         self.o = fake_opens(self.c)
 
+    def research_names(self, df):
+        """给“自带名单”的研究函数（research_v3.aplus_base 用 research_v2.U0）用：把实盘代码换成研究里的代码（GLDM → GLD）。
+        只改列名，价格一个数都不变。先确认两边名单除了登记过的改名以外完全一样——
+        以后再换标的时，如果只改了 config 没在 RESEARCH_NAME 里登记，这里会报错，而不是悄悄比错东西。"""
+        self.assertEqual([RESEARCH_NAME.get(s, s) for s in UNI], list(self.v.U0),
+                         "实盘名单（config.ROTATION_UNIVERSE）和研究名单（research_v2.U0）对不上")
+        return df.rename(columns=RESEARCH_NAME)
+
     def returns(self, o, c):
         """和研究引擎一样：R = 开盘到下一天开盘（算成绩）；R2 = 收盘到收盘（算杠杆，和实盘一致）。"""
         oo = (o.shift(-1) / o - 1)
@@ -187,8 +199,9 @@ class ResearchNoPeek(unittest.TestCase):
                 W2 = sum(v.make_W(dc, UNI, 2, "avg", "invvol", phase + 5 * j) for j in range(4)) / 4
                 pd.testing.assert_frame_equal(W1.loc[:d], W2.loc[:d])
                 # research_v3 / v4 / expectations 用的就是这一套：仓位 × 杠杆 = 风险资产总仓位
-                _, g1 = v3.aplus_base(phase, self.c, irx, R, R2)
-                _, g2 = v3.aplus_base(phase, dc, irx, Rd, R2d)
+                rn = self.research_names
+                _, g1 = v3.aplus_base(phase, rn(self.c), irx, rn(R), rn(R2))
+                _, g2 = v3.aplus_base(phase, rn(dc), irx, rn(Rd), rn(R2d))
                 pd.testing.assert_series_equal(g1.loc[:d], g2.loc[:d])
             pd.testing.assert_series_equal(self.r.lev_trend(self.c).loc[:d], self.r.lev_trend(dc).loc[:d])
 

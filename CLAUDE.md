@@ -1,7 +1,7 @@
 # Noire —— 给 Claude Code 的项目说明（每次会话开始自动读取）
 
 Noire（原名 Excaliber）是用户的美股自动交易系统（**模拟盘**每天运行；**实盘**（真钱）2026-11-01 起由用户打开，11-02 起每天 17:10 自动运行）：动量轮动策略“**A+ 稳健版**”（2026-10-15 用户选定，`aplus.py`）。
-7 只 ETF（SPY QQQ IWM EFA EEM TLT GLD）；资金分 4 批，各在月末 / 月末前第 5、10、15 个交易日按 1/3/6/12 月收益均值选前 2 名，
+7 只 ETF（SPY QQQ IWM EFA EEM TLT GLDM；1.1，2026-11-14 用户同意把黄金从 GLD 换成费用更低的 GLDM，`research\` 里的回测名单仍是 GLD）；资金分 4 批，各在月末 / 月末前第 5、10、15 个交易日按 1/3/6/12 月收益均值选前 2 名，
 两只按波动倒数分配，分数 ≤0 的份额换成 SHY；杠杆 = 30% ÷ 组合近 63 天波动（1~2 倍），SPY 低于 200 日均线时最多 1 倍；不借钱买 SHY。
 **第二条腿**（`dipbuy.py`，2026-10-16 用户同意启用）：SPY 收盘在 200 日线上方且 2 日 RSI < 10 → 买 SPY，收盘高于 5 日均线 → 卖；
 只用 A+ 没用完的额度（最多 1 倍，总仓位 ≤ 2 倍）。开关是 config.py 的 `DIP_ENABLED`。
@@ -24,6 +24,7 @@ Noire（原名 Excaliber）是用户的美股自动交易系统（**模拟盘**�
 3. 需要验证真实接口时只用空跑：`python paper_rotation.py`（不带 `--live`，结果写到 `reports\paper_status_dryrun.txt`）或 `python monitor.py`（只读）。
 4. 用 git 提交（作者 “Noire Bot”），提交信息写清楚改了什么、为什么。
 5. 更新 README.md；重要变化告诉用户，以便更新项目文档 `noire-system.md` 的变更记录。
+6. **所有改动都写进 `CHANGELOG.md`**（用户 2026-11-14 要求：“所有更改都写日志”）：改了哪些文件、每处改了什么、为什么、怎么验证的、怎么回滚；改策略或参数升 1.x，只修程序升补丁号，同时改 `VERSION`。
 
 ## 运行方式（已经自动化，一般不需要手动跑）
 - Windows 计划任务 `Noire Paper Rotation`：周一至五 17:00 / 17:30 / 18:00 → `run_paper.bat` → `paper_job.py`（成功一次后跳过；第 3 次或今天最后一次仍失败才报警；行情没更新到今天的收盘价时先等下一次；工作日 16:30 以前不换仓）。
@@ -35,13 +36,13 @@ Noire（原名 Excaliber）是用户的美股自动交易系统（**模拟盘**�
 ## 关键文件
 | 文件 | 作用 |
 |---|---|
-| config.py | 全部参数（标的、杠杆、风控阈值、共享成绩单位置、实盘 `LIVE_*`） |
+| config.py | 全部参数（标的、杠杆、风控阈值、共享成绩单位置、实盘 `LIVE_*`）；改候选名单 = 改策略，要用户同意，并同步 tests/test_safety.py 的名单测试和 tests/test_lookahead.py 的 `RESEARCH_NAME` |
 | runmode.py / broker.py | 模拟盘还是实盘（`NOIRE_PROFILE`）；连接券商的唯一入口（实盘三道闸 + 只读连接） |
 | aplus.py | **实盘策略**：4 批信号、波动倒数分配、杠杆（波动目标 + 趋势开关）——改它必须同步 research/research_v2.py 并跑测试 |
 | dipbuy.py | **第二条腿**：RSI(2) 超跌反弹，只用 A+ 剩余额度——改它必须同步 research/research_v3.py 并跑测试 |
 | fills.py / tracking.py | 成交价记录（monitor 每小时写 logs/fills.csv）；实盘 vs 模型对账 → reports/tracking.txt（只读） |
 | rotation.py / backtest.py | 旧的简单回测（rotation.py 的 load_panel 仍被实盘使用） |
-| paper_rotation.py | 每日换仓（返回 ok / stopped / blocked；加 --retry-if-stale 时行情没更新返回 stale）；logs/batch_picks.json 记每批选股，信号日没变、选股变了时写一句说明 |
+| paper_rotation.py | 每日换仓（返回 ok / stopped / blocked；加 --retry-if-stale 时行情没更新返回 stale）；logs/batch_picks.json 记每批选股，信号日没变、选股变了时写一句说明；行情对齐后不足 300 个交易日不换仓（1.1，防止下载不完整时全部换成现金） |
 | cashflow.py | 实盘出入金：只读查券商入金/出金，记 live/cash_flows.csv；成绩单、回撤、“今日”都扣除（“今日”的起点见 day_basis） |
 | paper_job.py | 有限次数重试 + 运行锁 + 工作日 16:30 以前不换仓 |
 | pricecheck.py | 换仓前和 Alpaca 日线核对收盘价（只报警，不影响交易） |

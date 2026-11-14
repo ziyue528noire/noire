@@ -48,6 +48,7 @@ TARGETS_LOG = rt("logs", "targets.csv")
 PICKS_FILE = rt("logs", "batch_picks.json")   # 上一次正式运行时每一批拿什么（1.0.3，只用来写说明）
 STATUS_FILE = rt(config.REPORT_DIR, "paper_status.txt")
 DRYRUN_STATUS_FILE = rt(config.REPORT_DIR, "paper_status_dryrun.txt")   # 空跑写这里，不覆盖正式状态
+MIN_HISTORY = 300   # 1.1：几只 ETF 的行情对齐以后，至少要有这么多个交易日才换仓（见 history_problem）
 
 
 def trading_calendar(client, as_of: dt.date):
@@ -78,6 +79,27 @@ def price_sanity(closes: pd.DataFrame, max_jump=0.25):
         elif p > 0 and abs(x / p - 1) > max_jump:
             problems.append(f"{s} 一天{'涨' if x > p else '跌'} {abs(x / p - 1):.0%}（{p:.2f} → {x:.2f}）")
     return problems
+
+
+def history_problem(symbols, closes: pd.DataFrame):
+    """行情历史够不够长（1.1，2026-11-14）。够 → None；不够 → 一句说明，调用方不交易。
+    为什么要查：每一批要用信号日以前 253 个交易日的价格打分，最早的那一批信号日还在一个月以前，一共要 280 天左右；
+    不够的时候策略的规则是“数据不够，拿现金”——四批全部换成 SHY。真实行情有两千多天，正常永远够；
+    不够只可能是下载不完整。旧标的有本地缓存可以比对（data.py 会拒绝明显变短的下载），
+    新换进名单的标的（GLDM）第一次下载时没有缓存可比，所以在这里再拦一道：宁可这次不换仓，也不把持仓全卖成现金。"""
+    if len(closes) >= MIN_HISTORY:
+        return None
+    import data
+    rows = []
+    for s in symbols:
+        try:
+            df = data.load_prices(s)
+            rows.append((len(df), f"{s} 只有 {len(df)} 天（从 {df.index[0].date()} 起）"))
+        except Exception:
+            rows.append((0, f"{s} 读不出来"))
+    shortest = min(rows)[1] if rows else "不知道是哪一只"
+    return (f"{len(symbols)} 只对齐以后只有 {len(closes)} 个交易日，至少要 {MIN_HISTORY} 个；最短的是 {shortest}，"
+            f"多半是下载不完整")
 
 
 def check_data(client, last_bar: dict, as_of: dt.date, now: dt.datetime):
@@ -160,6 +182,9 @@ def main():
     age = (pd.Timestamp(now.date()) - closes.index[-1]).days
     if age > 5:
         sys.exit(f"数据太旧（最新一天是 {closes.index[-1].date()}），为安全起见不操作")
+    short = history_problem(symbols, closes)
+    if short:
+        sys.exit("行情历史太短，为安全起见不操作：" + short)
     bad_px = price_sanity(closes)
     if bad_px:
         sys.exit("行情数据异常，为安全起见不操作：" + "；".join(bad_px))

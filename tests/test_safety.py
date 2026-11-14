@@ -40,7 +40,7 @@ assert paths.RUNTIME.startswith(TMP), "测试没有使用临时目录，停止�
 # 假行情：QQQ 最强、EEM 第二，其余较弱，TLT 下跌 → 目标应是 QQQ + EEM
 DATA_DIR = os.path.join(TMP, "data")
 DRIFT = {"QQQ": 0.0012, "EEM": 0.0009, "SPY": 0.0004, "IWM": 0.0002, "EFA": 0.0001,
-         "GLD": 0.0001, "TLT": -0.0004, "SHY": 0.00005}
+         "GLDM": 0.0001, "TLT": -0.0004, "SHY": 0.00005}
 # 假行情固定长度、以今天结尾，而且是确定的（不用随机数）：每天的形状完全一样，只是日期往后挪。
 # 以前是“随机走势画到今天”，每过一天就多一个随机数，测试依赖的排名和趋势会慢慢变——
 # 模拟发现 2027-02-12 起测试会失败，而自检失败会让当天停止交易（2026-10-16 修正）。
@@ -360,6 +360,20 @@ class SafetyTests(unittest.TestCase):
         self.assertIn("不是本系统提交的订单", text)
         self.assertIn("不明来源的持仓", text)
 
+    def test_leftover_gld_is_left_alone_and_reported(self):
+        """1.1：名单里的黄金换成 GLDM 以后，GLD 不再是策略的标的。账户里万一还有 GLD（换的那天两个账户都没有）：
+        策略不卖它、不算进本金，盘中监控会提醒有“不明来源的持仓”，由人来决定怎么处理。"""
+        B.positions = {"GLD": (10, 3500.0)}
+        out = run(paper_rotation.main, "--live")
+        self.assertTrue(B.orders)
+        self.assertNotIn("GLD", {o.symbol for o in B.orders})            # 不卖、也不会再买
+        self.assertIn("手动持仓（策略不管）：$3,500", out)
+        notional = sum(float(o.qty) * last_price(o.symbol) for o in B.orders if o.side.value == "buy")
+        self.assertAlmostEqual(notional / (100000 - 3500), 2 * (1 - config.CASH_BUFFER), delta=0.02)   # 本金不含 GLD
+        run(monitor.main)
+        with open(os.path.join(paths.RUNTIME, "alerts.txt"), encoding="utf-8") as f:
+            self.assertIn("账户里有不明来源的持仓：GLD", f.read())
+
     def test_monitor_quiet_when_normal(self):
         run(paper_rotation.main, "--live")
         for o in B.orders:
@@ -578,7 +592,7 @@ class CloseDataTests(unittest.TestCase):
         B.reset()
 
     def tearDown(self):
-        make_data()                                           # 有的测试把 GLD 改成少一天，这里恢复
+        make_data()                                           # 有的测试把 GLDM 改成少一天，这里恢复
 
     @staticmethod
     def job(hour, minute, day=None):
@@ -599,13 +613,13 @@ class CloseDataTests(unittest.TestCase):
         return paper_job.load_state(f"{dt.date.today():%Y-%m-%d}")
 
     @staticmethod
-    def gld_one_day_short():
-        """GLD 少了最新一天（Yahoo 还没更新完）→“行情不完整”。不管今天星期几、现在几点都一样。"""
-        write_prices("GLD", fake_path(DRIFT["GLD"])[:-1], fake_index()[:-1])
+    def gldm_one_day_short():
+        """GLDM 少了最新一天（Yahoo 还没更新完）→“行情不完整”。不管今天星期几、现在几点都一样。"""
+        write_prices("GLDM", fake_path(DRIFT["GLDM"])[:-1], fake_index()[:-1])
 
     # —— 行情没更新：先等，最后一次才按前一天的价格 ——
     def test_stale_data_waits_for_the_next_run_then_falls_back(self):
-        self.gld_one_day_short()
+        self.gldm_one_day_short()
         rc, out = self.job(17, 0)
         self.assertIn("行情还没更新好", out)
         self.assertIn("30 分钟后自动再试", out)
@@ -621,11 +635,11 @@ class CloseDataTests(unittest.TestCase):
         rc, out = self.job(18, 0)                             # 第 3 次 = 今天最后一次：按前一天的价格换仓并报警
         self.assertEqual(rc, 0)
         self.assertTrue(B.orders)
-        self.assertIn("行情不完整：GLD", self.alerts_text())
+        self.assertIn("行情不完整：GLDM", self.alerts_text())
         self.assertTrue(self.state()["success"])
 
     def test_stale_data_trades_once_the_close_arrives(self):
-        self.gld_one_day_short()
+        self.gldm_one_day_short()
         self.job(17, 0)
         self.assertEqual(B.orders, [])
         make_data()                                           # 17:30 Yahoo 更新好了
@@ -635,10 +649,67 @@ class CloseDataTests(unittest.TestCase):
         self.assertEqual(self.alerts_text(), "")              # 等到了就不报警
 
     def test_last_run_of_the_day_does_not_wait(self):
-        self.gld_one_day_short()
+        self.gldm_one_day_short()
         self.job(18, 10)                                      # 例如电脑 18:10 才醒：第 1 次就是今天最后一次
         self.assertTrue(B.orders)
-        self.assertIn("行情不完整：GLD", self.alerts_text())
+        self.assertIn("行情不完整：GLDM", self.alerts_text())
+
+    # —— 1.1：行情历史太短（新换进名单的 GLDM 第一次下载不完整）→ 这次不换仓，而不是把持仓全换成现金 ——
+    @staticmethod
+    def gldm_history(n):
+        """GLDM 的行情只有最近 n 天（第一次下载没下全）；其余 7 只正常。"""
+        write_prices("GLDM", fake_path(DRIFT["GLDM"])[-n:], fake_index()[-n:])
+
+    def test_short_history_refuses_to_trade_instead_of_going_to_cash(self):
+        self.gldm_history(200)
+        symbols = config.ROTATION_UNIVERSE + [config.CASH_SYMBOL]
+        closes = paper_rotation.load_panel(symbols)[1]
+        cal = paper_rotation.trading_calendar(fakebroker.TradingClient("k", "s"), closes.index[-1].date())
+        target, _, lines = paper_rotation.aplus.compute(closes, cal)
+        self.assertEqual(list(target.index), [config.CASH_SYMBOL])       # 策略的规则在这种行情上是“数据不够，全部拿现金”
+        self.assertEqual(sum("数据不够" in l for l in lines), 4)
+        B.positions = {"QQQ": (1000, 100000.0), "EEM": (960, 96000.0)}    # 账户里正拿着 2 倍的仓位
+        B.cash = -96000.0
+        with self.assertRaises(SystemExit) as cm:
+            run(paper_rotation.main, "--live")
+        self.assertIn("行情历史太短", str(cm.exception))
+        self.assertIn("GLDM 只有 200 天", str(cm.exception))
+        self.assertEqual(B.orders, [])                                    # 一笔都没下：没有把持仓卖成现金
+        self.assertFalse(os.path.exists(paper_rotation.STATUS_FILE))
+        with self.assertRaises(SystemExit):                               # 空跑也一样
+            run(paper_rotation.main)
+
+    def test_short_history_counts_as_a_failed_run_and_recovers(self):
+        self.gldm_history(200)
+        rc, out = self.job(17, 0)
+        self.assertEqual(rc, 1)                                           # 算一次失败：30 分钟后自动重试
+        self.assertEqual(B.orders, [])
+        st = self.state()
+        self.assertEqual((st["attempts"], st["success"], st["history"][-1]["result"]), (1, False, "failed"))
+        self.assertIn("行情历史太短", st["history"][-1]["error"])
+        self.assertEqual(self.alerts_text(), "")                          # 第 1 次失败不报警（和其他错误一样）
+        make_data()                                                       # 17:30 重新下载，这次是完整的
+        rc, out = self.job(17, 30)
+        self.assertEqual(rc, 0)
+        self.assertTrue(B.orders)
+        self.gldm_history(200)
+        B.reset()
+        shutil.rmtree(paths.RUNTIME, ignore_errors=True)
+        os.makedirs(paths.RUNTIME)
+        self.job(18, 10)                                                  # 今天最后一次自动运行还是不够 → 报警
+        self.assertEqual(B.orders, [])
+        self.assertIn("行情历史太短", self.alerts_text())
+
+    def test_history_limit_is_exactly_min_history(self):
+        n = paper_rotation.MIN_HISTORY
+        self.gldm_history(n - 1)
+        with self.assertRaises(SystemExit):
+            run(paper_rotation.main, "--live")
+        self.assertEqual(B.orders, [])
+        self.gldm_history(n)                                              # 正好够：照常换仓，四批都算得出来
+        out = run(paper_rotation.main, "--live")
+        self.assertTrue(B.orders)
+        self.assertNotIn("数据不够", out)
 
     def test_failure_on_the_last_run_alerts_right_away(self):
         orig = paper_job.run_rotation
@@ -1112,6 +1183,29 @@ class APlusTests(unittest.TestCase):
         self.assertEqual(got[0], dt.date(2026, 10, 30))
         self.assertEqual(got[15], dt.date(2026, 10, 9))
 
+    def test_universe_is_the_agreed_seven_etfs(self):
+        """候选名单 = 用户同意的 7 只（1.1，2026-11-14：黄金是 GLDM，不再是 GLD），避险是 SHY。
+        改名单就是改策略：要先问用户，并且同时改这里、CHANGELOG.md 和 README。"""
+        self.assertEqual(list(config.ROTATION_UNIVERSE), ["SPY", "QQQ", "IWM", "EFA", "EEM", "TLT", "GLDM"])
+        self.assertEqual(config.CASH_SYMBOL, "SHY")
+        self.assertNotIn(config.CASH_SYMBOL, config.ROTATION_UNIVERSE)
+        self.assertEqual(monitor.MANAGED, set(config.ROTATION_UNIVERSE) | {"SHY"})   # 监控认的也是同一份名单
+
+    def test_min_history_is_enough_for_all_four_batches(self):
+        """换仓前要求的最少行情天数（paper_rotation.MIN_HISTORY）够不够：只有这么多天的行情时，
+        不管今天在一个月里的哪个位置，四批都算得出来，没有一批因为“数据不够”去拿现金。
+        （门槛定低了的话，行情刚好卡在门槛上那天会有批次悄悄换成现金。）"""
+        n = paper_rotation.MIN_HISTORY
+        for shift in range(70):                                         # 结束日挪 70 个交易日，一个月里的每个位置都试到
+            start = pd.Timestamp("2025-01-01") + pd.offsets.BDay(shift)
+            c = synthetic({"QQQ": alternating(0.01, 0.002), "EEM": alternating(0.01, 0.001)}, n=n, start=start)
+            days = pd.bdate_range(c.index[0], c.index[-1] + pd.offsets.MonthEnd(0))
+            _, notes = aplus.base_weights(c, days, c.index[-1])
+            self.assertEqual(len(notes), 4)
+            for note in notes:
+                self.assertNotIn("数据不够", note, f"结束日 {c.index[-1].date()}")
+                self.assertNotIn("还没有换仓日", note, f"结束日 {c.index[-1].date()}")
+
     def test_inverse_vol_weights_and_negative_score_to_cash(self):
         up = 0.004
         c = synthetic({"QQQ": alternating(0.02, up), "EEM": alternating(0.01, up)})
@@ -1119,7 +1213,7 @@ class APlusTests(unittest.TestCase):
         self.assertAlmostEqual(w["QQQ"], 1 / 3, delta=0.02)             # 波动大一倍 → 只拿一半的份额
         self.assertAlmostEqual(w["EEM"], 2 / 3, delta=0.02)
         c = synthetic({"QQQ": alternating(0.01, up), "EEM": alternating(0.01, -0.001),
-                       **{s: alternating(0.01, -0.002) for s in ("SPY", "IWM", "EFA", "TLT", "GLD")}})
+                       **{s: alternating(0.01, -0.002) for s in ("SPY", "IWM", "EFA", "TLT", "GLDM")}})
         w, _ = aplus.tranche_weights(c, c.index[-1])
         self.assertAlmostEqual(w["QQQ"], 0.5, delta=0.02)
         self.assertAlmostEqual(w[config.CASH_SYMBOL], 0.5, delta=0.02)  # 第二名也在跌 → 那一份拿现金
@@ -1154,9 +1248,9 @@ class APlusTests(unittest.TestCase):
         self.assertLessEqual(float(aplus.final_weights(base, 2.0).sum()), config.LEVERAGE + 1e-9)
 
     def test_four_tranches_average(self):
-        # 换仓日不同的几批会选出不同的组合：前半段 GLD 最强，后来 QQQ 最强
+        # 换仓日不同的几批会选出不同的组合：前半段 GLDM 最强，后来 QQQ 最强
         n = 400
-        c = synthetic({"GLD": lambda i: 0.004 if i < n - 12 else -0.03,
+        c = synthetic({"GLDM": lambda i: 0.004 if i < n - 12 else -0.03,
                        "QQQ": lambda i: 0.002 if i < n - 12 else 0.02,
                        "EEM": lambda i: 0.003})
         days = pd.bdate_range(c.index[0], c.index[-1] + pd.offsets.MonthEnd(0))

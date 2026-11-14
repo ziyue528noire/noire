@@ -172,7 +172,7 @@ class LiveModeTests(unittest.TestCase):
 
     def test_live_waits_for_todays_close_before_trading(self):
         # 1.0.2：行情还没更新到今天的收盘价 → 前两次不下单、不报警；最后一次（不加 --retry-if-stale）照常换仓并报警
-        base.write_prices("GLD", base.fake_path(base.DRIFT["GLD"])[:-1], base.fake_index()[:-1])   # GLD 少最新一天
+        base.write_prices("GLDM", base.fake_path(base.DRIFT["GLDM"])[:-1], base.fake_index()[:-1])   # GLDM 少最新一天
         try:
             r = scenario("rotation", submit=True, flag=True, config=LIVE_ON, account=EMPTY_10K,
                          extra_argv=["--retry-if-stale"])
@@ -182,7 +182,7 @@ class LiveModeTests(unittest.TestCase):
             self.assertEqual(r["alerts"], "")
             r = scenario("rotation", submit=True, flag=True, config=LIVE_ON, account=EMPTY_10K)
             self.assertTrue(r["orders"])
-            self.assertIn("【实盘】自动换仓：行情不完整：GLD", r["alerts"])
+            self.assertIn("【实盘】自动换仓：行情不完整：GLDM", r["alerts"])
         finally:
             base.make_data()
 
